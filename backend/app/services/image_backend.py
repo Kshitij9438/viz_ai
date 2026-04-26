@@ -40,9 +40,9 @@ class PollinationsBackend:
             url += f"&image={quote(reference_image_url)}"
             if reference_strength is not None:
                 url += f"&strength={reference_strength}"
-        # Pollinations occasionally returns 5xx; retry with backoff
+        # Pollinations is free but rate-limits aggressively; retry with backoff
         last_exc: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 r = await self.client.get(url)
                 r.raise_for_status()
@@ -51,8 +51,8 @@ class PollinationsBackend:
                 raise RuntimeError(f"Unexpected content-type: {r.headers.get('content-type')}")
             except Exception as e:  # noqa: BLE001
                 last_exc = e
-                await asyncio.sleep(1.5 * (attempt + 1))
-        raise RuntimeError(f"Pollinations failed: {last_exc}")
+                await asyncio.sleep(3.0 * (attempt + 1))
+        raise RuntimeError(f"Pollinations failed after 5 retries: {last_exc}")
 
 
 class HuggingFaceBackend:

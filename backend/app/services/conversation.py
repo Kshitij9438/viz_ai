@@ -258,21 +258,26 @@ async def converse(
                 else:
                     captured_call = {"name": "generate", "arguments": params.model_dump()}
 
-                    asset_bundle = await run_generation(
-                        db,
-                        params=params,
-                        user_id=session.user_id,
-                        session_id=session.id,
-                        taste=taste,
-                        business=business,
-                    )
+                    try:
+                        asset_bundle = await run_generation(
+                            db,
+                            params=params,
+                            user_id=session.user_id,
+                            session_id=session.id,
+                            taste=taste,
+                            business=business,
+                        )
 
-                    session.last_prompt = asset_bundle["prompt_used"]
+                        session.last_prompt = asset_bundle["prompt_used"]
 
-                    tool_result = json.dumps({
-                        "status": "success",
-                        "bundle_id": asset_bundle["bundle_id"],
-                    })
+                        tool_result = json.dumps({
+                            "status": "success",
+                            "bundle_id": asset_bundle["bundle_id"],
+                        })
+                    except Exception as gen_exc:  # noqa: BLE001
+                        tool_result = json.dumps({
+                            "error": f"Image generation failed: {gen_exc}. Please try again in a moment.",
+                        })
 
             # Tool message — tool_call_id MUST match the assistant's call id
             tool_seq = await _next_seq(db, session.id)
