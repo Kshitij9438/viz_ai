@@ -1,0 +1,11 @@
+# ─── Dependencies ───
+node_modules/
+
+# ─── Build Output ───
+.next/
+out/
+
+# ─── Environment ───
+.env
+.env.local
+.env.production

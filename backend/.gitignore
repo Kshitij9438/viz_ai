@@ -1,0 +1,16 @@
+# ─── Python ───
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ─── Environment ───
+.env
+.env.local
+.env.production
+
+# ─── Database ───
+*.db
+
+# ─── Generated Assets ───
+storage/

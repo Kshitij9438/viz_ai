@@ -1,0 +1,31 @@
+# ─── Dependencies ───
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# ─── Environment & Secrets ───
+.env
+.env.local
+.env.production
+backend/.env
+frontend/.env
+
+# ─── Build Outputs ───
+frontend/.next/
+frontend/out/
+
+# ─── Database (local dev only) ───
+*.db
+
+# ─── Generated Assets ───
+backend/storage/
+
+# ─── OS Files ───
+.DS_Store
+Thumbs.db
+
+# ─── IDE ───
+.vscode/
+.idea/

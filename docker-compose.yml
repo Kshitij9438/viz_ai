@@ -1,0 +1,17 @@
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env
+    ports: ["8000:8000"]
+    volumes:
+      - ./backend/storage:/app/storage
+      - ./backend/vizzy.db:/app/vizzy.db
+    extra_hosts: ["host.docker.internal:host-gateway"]  # so backend can reach Ollama on host
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+
+  frontend:
+    build: ./frontend
+    env_file: ./frontend/.env
+    ports: ["3000:3000"]
+    depends_on: [backend]
