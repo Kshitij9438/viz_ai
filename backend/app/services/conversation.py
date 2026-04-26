@@ -104,8 +104,16 @@ def _msgs_to_model(msgs: list[Message]) -> list[dict[str, Any]]:
          for the same reason.
       3. Every tool_call in assistant messages is passed through
          _normalize_tool_call() to guarantee type + id fields.
+      4. After assembly, any assistant message with tool_calls that is NOT
+         followed by tool responses for ALL of its call IDs is stripped down
+         to a plain assistant message (tool_calls removed).  This prevents the
+         OpenAI "tool_call_id did not have response" 400 error.
     """
     out: list[dict[str, Any]] = []
+
+    # Collect the set of valid tool_call_ids from all assistant messages
+    # so tool messages can verify their parent exists in the window.
+    valid_call_ids: set[str] = set()
 
     for m in msgs:
         if m.role == "assistant" and m.tool_calls:
@@ -116,6 +124,8 @@ def _msgs_to_model(msgs: list[Message]) -> list[dict[str, Any]]:
                 "content": m.content or "",
                 "tool_calls": normalized,
             })
+            for c in normalized:
+                valid_call_ids.add(c["id"])
 
         elif m.role == "tool":
             tool_call_id = (
@@ -124,9 +134,8 @@ def _msgs_to_model(msgs: list[Message]) -> list[dict[str, Any]]:
             # Rule 2: drop irrecoverable orphan tool messages
             if not tool_call_id:
                 continue
-            # Rule 1: drop if the immediately preceding out-entry is not
-            # an assistant message that has tool_calls (orphan at boundary)
-            if not out or out[-1].get("role") != "assistant" or not out[-1].get("tool_calls"):
+            # Rule 1: drop if the parent assistant tool_call is not in our window
+            if tool_call_id not in valid_call_ids:
                 continue
             out.append({
                 "role": "tool",
@@ -140,7 +149,39 @@ def _msgs_to_model(msgs: list[Message]) -> list[dict[str, Any]]:
                 "content": m.content or "",
             })
 
-    return out
+    # ---- Post-pass: ensure every assistant tool_calls block is fully answered ----
+    # Collect all tool_call_ids that actually have a tool response in `out`.
+    answered_ids: set[str] = set()
+    for entry in out:
+        if entry.get("role") == "tool" and entry.get("tool_call_id"):
+            answered_ids.add(entry["tool_call_id"])
+
+    # Walk through and fix / remove incomplete assistant+tool_calls groups.
+    cleaned: list[dict[str, Any]] = []
+    i = 0
+    while i < len(out):
+        entry = out[i]
+        if entry.get("role") == "assistant" and entry.get("tool_calls"):
+            calls = entry["tool_calls"]
+            expected_ids = {c["id"] for c in calls}
+            if expected_ids <= answered_ids:
+                # All tool responses present — keep assistant and its tool messages
+                cleaned.append(entry)
+            else:
+                # Missing at least one tool response — strip tool_calls and
+                # drop any orphan tool messages that reference these calls.
+                cleaned.append({
+                    "role": "assistant",
+                    "content": entry.get("content") or "",
+                })
+                # Skip the following tool messages that belong to this group
+                while i + 1 < len(out) and out[i + 1].get("role") == "tool" and out[i + 1].get("tool_call_id") in expected_ids:
+                    i += 1
+        else:
+            cleaned.append(entry)
+        i += 1
+
+    return cleaned
 
 
 # ---------------- MAIN LOOP ---------------- #
