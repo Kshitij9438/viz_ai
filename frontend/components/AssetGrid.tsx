@@ -30,7 +30,7 @@ export function AssetGrid({
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={a.url} alt={`variant ${a.index}`} className="h-full w-full object-cover" />
-          console.log("ASSET URL:", a.url);
+
           {!single && (
             <span className="absolute left-2 top-2 rounded-md bg-black/60 px-2 py-0.5 text-xs text-white">
               {a.index}
