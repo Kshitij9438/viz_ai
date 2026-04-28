@@ -155,7 +155,7 @@ async def run_generation(
 
     asset_records: list[Asset] = []
     bundle_type = "image_grid"
-    expires_at = datetime.now(timezone.utc) + timedelta(days=30)
+    expires_at = datetime.utcnow() + timedelta(days=30)
 
     # ---- routing ----
     if params.output_type in ("image", "style_transfer"):
@@ -274,7 +274,7 @@ async def run_generation(
 
     db.add_all(asset_records)
     job.status = "complete"
-    job.completed_at = datetime.now(timezone.utc)
+    job.completed_at = datetime.utcnow()
     job.asset_ids = [a.id for a in asset_records]
     await db.commit()
 

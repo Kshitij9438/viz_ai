@@ -110,7 +110,7 @@ async def update_taste_after_feedback(
         "chose_variant": chosen_variant,
         "feedback": feedback,
     }]
-    taste.last_updated = datetime.now(timezone.utc)
+    taste.last_updated = datetime.utcnow()
     await db.commit()
 
 
@@ -128,7 +128,7 @@ async def end_session_summary(db: AsyncSession, session: SessionModel) -> None:
     except Exception:  # noqa: BLE001
         summary = "Creative session."
     session.summary = summary
-    session.ended_at = datetime.now(timezone.utc)
+    session.ended_at = datetime.utcnow()
     session.status = "ended"
     db.add(SessionSummary(user_id=session.user_id, session_id=session.id, summary=summary))
     await db.commit()

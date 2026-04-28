@@ -15,7 +15,8 @@ class Settings(BaseSettings):
     GITHUB_VISION_MODEL: str = "gpt-4.1-mini"
 
     # Database
-    DATABASE_URL: str = "sqlite+aiosqlite:///./vizzy.db"
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    
 
     # Image generation backend
     IMAGE_BACKEND: str = "pollinations"
