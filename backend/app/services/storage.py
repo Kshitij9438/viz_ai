@@ -15,6 +15,7 @@ class LocalStorage:
 
     def save_bytes(self, data: bytes, suffix: str = ".jpg", subdir: str = "generated") -> tuple[str, str]:
         """Returns (file_path, public_url)."""
+        print("🔥 PUBLIC_BASE_URL:", settings.PUBLIC_BASE_URL)
         out_dir = self.base_dir / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
         name = f"{uuid.uuid4().hex}{suffix}"

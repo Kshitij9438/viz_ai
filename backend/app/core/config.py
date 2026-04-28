@@ -24,10 +24,10 @@ class Settings(BaseSettings):
 
     # Storage & public URL
     STORAGE_DIR: str = "./storage"
-    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
+    PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
 
     # CORS (comma-separated for multiple origins)
-    FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+    FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "")
 
     # Railway injects PORT automatically
     PORT: int = int(os.environ.get("PORT", "8000"))

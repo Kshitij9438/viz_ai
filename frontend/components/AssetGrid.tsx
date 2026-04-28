@@ -15,9 +15,9 @@ export function AssetGrid({
         single
           ? "mt-3"
           : "mt-3 grid gap-3 " +
-            (bundle.assets.length >= 6
-              ? "grid-cols-3"
-              : bundle.assets.length >= 2
+          (bundle.assets.length >= 6
+            ? "grid-cols-3"
+            : bundle.assets.length >= 2
               ? "grid-cols-2"
               : "grid-cols-1")
       }
@@ -30,6 +30,7 @@ export function AssetGrid({
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img src={a.url} alt={`variant ${a.index}`} className="h-full w-full object-cover" />
+          console.log("ASSET URL:", a.url);
           {!single && (
             <span className="absolute left-2 top-2 rounded-md bg-black/60 px-2 py-0.5 text-xs text-white">
               {a.index}
