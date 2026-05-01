@@ -12,13 +12,12 @@ def user_or_ip_key(request: Request) -> str:
         key = f"user:{user.id}"
     else:
         key = f"ip:{get_remote_address(request)}"
-
-    # 🔥 DEBUG LINE
-    print("RATE LIMIT KEY:", key)
-
     return key
 
-limiter = Limiter(key_func=user_or_ip_key)
+limiter = Limiter(
+    key_func=user_or_ip_key,
+    default_limits=["100/minute"]
+)
 
 
 def rate_limit_handler(request: Request, exc: RateLimitExceeded):

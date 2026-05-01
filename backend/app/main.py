@@ -31,7 +31,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
 # Parse FRONTEND_ORIGIN as comma-separated to support multiple origins
-_origins = [o.strip() for o in settings.FRONTEND_ORIGIN.split(",") if o.strip()]
+_origins = [o.strip() for o in settings.FRONTEND_ORIGIN.split(",") if o.strip()] or ["*"]
 
 app.add_middleware(
     CORSMiddleware,
