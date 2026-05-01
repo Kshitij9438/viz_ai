@@ -1,7 +1,13 @@
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+/* =========================
+🧠 TYPES
+========================= */
+
 export type Attachment = { type: string; url: string; caption?: string };
+
 export type Asset = { id: string; url: string; index: number; type: string };
+
 export type AssetBundle = {
   bundle_id: string;
   type: string;
@@ -9,6 +15,7 @@ export type AssetBundle = {
   prompt_used: string;
   actions: string[];
 };
+
 export type ChatResponse = {
   reply: string;
   asset_bundle: AssetBundle | null;
@@ -18,9 +25,9 @@ export type ChatResponse = {
   guest_token?: string | null;
 };
 
-/* ---------------------- */
-/* 🔐 STORAGE UTILITIES */
-/* ---------------------- */
+/* =========================
+🔐 STORAGE
+========================= */
 
 const STORAGE = {
   TOKEN: "vizzy_token",
@@ -51,9 +58,9 @@ function clearIdentity() {
   remove(STORAGE.SESSION);
 }
 
-/* ---------------------- */
-/* 🔐 AUTH HEADERS */
-/* ---------------------- */
+/* =========================
+🔐 HEADERS
+========================= */
 
 function authHeaders(): Record<string, string> {
   const token = get(STORAGE.TOKEN);
@@ -73,12 +80,14 @@ function authHeaders(): Record<string, string> {
     };
   }
 
-  return { "Content-Type": "application/json" };
+  return {
+    "Content-Type": "application/json",
+  };
 }
 
-/* ---------------------- */
-/* 🔐 AUTH API */
-/* ---------------------- */
+/* =========================
+🔐 AUTH
+========================= */
 
 export async function register(body: {
   email: string;
@@ -95,14 +104,10 @@ export async function register(body: {
 
   const data = await r.json();
 
-  // 🔥 FULL IDENTITY RESET
   clearIdentity();
-
-  // 🔥 SET NEW AUTH
   set(STORAGE.TOKEN, data.access_token);
 
-  // 🔥 FORCE FULL APP RESET
-  window.location.href = "/";
+  window.location.reload();
 
   return data;
 }
@@ -121,23 +126,41 @@ export async function login(body: {
 
   const data = await r.json();
 
-  // 🔥 FULL IDENTITY RESET
   clearIdentity();
-
-  // 🔥 SET NEW AUTH
   set(STORAGE.TOKEN, data.access_token);
 
-  // 🔥 FORCE FULL APP RESET
-  window.location.href = "/";
+  window.location.reload();
 
   return data;
 }
 
-/* ---------------------- */
-/* 💬 CHAT */
-/* ---------------------- */
+/* =========================
+👤 GUEST (EXPLICIT ONLY)
+========================= */
+
+export async function createGuest(): Promise<{ guest_token: string }> {
+  const r = await fetch(`${API}/api/v1/auth/guest`, {
+    method: "POST",
+  });
+
+  if (!r.ok) throw new Error("guest failed");
+
+  const data = await r.json();
+
+  clearIdentity();
+  set(STORAGE.GUEST, data.guest_token);
+
+  window.location.reload();
+
+  return data;
+}
+
+/* =========================
+💬 CHAT
+========================= */
 
 export async function sendChat(body: {
+  session_id?: string;
   message: string;
   attachments?: Attachment[];
 }): Promise<ChatResponse> {
@@ -148,7 +171,7 @@ export async function sendChat(body: {
     headers: authHeaders(),
     body: JSON.stringify({
       ...body,
-      session_id: sessionId,
+      session_id: sessionId || body.session_id,
     }),
   });
 
@@ -161,22 +184,16 @@ export async function sendChat(body: {
 
   const data = await r.json();
 
-  // 🔥 SESSION SOURCE OF TRUTH
   if (data?.session_id) {
     set(STORAGE.SESSION, data.session_id);
-  }
-
-  // 🔥 GUEST TOKEN MANAGEMENT
-  if (data?.guest_token && !get(STORAGE.TOKEN)) {
-    set(STORAGE.GUEST, data.guest_token);
   }
 
   return data;
 }
 
-/* ---------------------- */
-/* 📂 FILE UPLOAD */
-/* ---------------------- */
+/* =========================
+📂 UPLOAD
+========================= */
 
 export async function uploadFile(file: File): Promise<Attachment> {
   const fd = new FormData();
@@ -200,25 +217,27 @@ export async function uploadFile(file: File): Promise<Attachment> {
   return r.json();
 }
 
-/* ---------------------- */
-/* 👍 FEEDBACK */
-/* ---------------------- */
+/* =========================
+👍 FEEDBACK (FIXED)
+========================= */
 
 export async function sendFeedback(body: {
+  session_id?: string;
   bundle_id: string;
   chosen_variant?: number;
   feedback?: string;
 }): Promise<void> {
   const sessionId = get(STORAGE.SESSION);
 
-  if (!sessionId) return;
+  const finalSessionId = body.session_id || sessionId;
+  if (!finalSessionId) return;
 
   await fetch(`${API}/api/v1/feedback`, {
     method: "POST",
     headers: authHeaders(),
     body: JSON.stringify({
       ...body,
-      session_id: sessionId,
+      session_id: finalSessionId,
     }),
   });
 }
