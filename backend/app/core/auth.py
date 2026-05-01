@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -19,9 +17,9 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-# ---------------------------
+# =========================
 # 🔐 PASSWORDS
-# ---------------------------
+# =========================
 
 def hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
@@ -31,9 +29,9 @@ def verify_password(plain: str, hashed: str) -> bool:
     return pwd_context.verify(plain, hashed)
 
 
-# ---------------------------
+# =========================
 # 🔑 TOKENS
-# ---------------------------
+# =========================
 
 def _create_token(user_id: str, token_type: str, expires_in: timedelta) -> str:
     expire = datetime.now(timezone.utc) + expires_in
@@ -57,17 +55,21 @@ def create_guest_token(user_id: str) -> str:
     )
 
 
-# ---------------------------
+# =========================
 # ⚠️ EXCEPTIONS
-# ---------------------------
+# =========================
 
-def _credentials_exception(detail: str = "Could not validate credentials") -> HTTPException:
+def _credentials_exception(detail: str = "Authentication required") -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=detail,
         headers={"WWW-Authenticate": "Bearer"},
     )
 
+
+# =========================
+# 🔍 TOKEN DECODE
+# =========================
 
 def _decode_token(token: str, expected_type: str) -> str:
     try:
@@ -84,9 +86,9 @@ def _decode_token(token: str, expected_type: str) -> str:
         raise _credentials_exception() from exc
 
 
-# ---------------------------
+# =========================
 # 🗄️ DB HELPERS
-# ---------------------------
+# =========================
 
 async def _load_user_or_401(db: AsyncSession, user_id: str) -> User:
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
@@ -95,9 +97,9 @@ async def _load_user_or_401(db: AsyncSession, user_id: str) -> User:
     return user
 
 
-# ---------------------------
+# =========================
 # 👤 OPTIONAL USER
-# ---------------------------
+# =========================
 
 async def get_optional_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
@@ -113,6 +115,10 @@ async def get_optional_user(
     return await _load_user_or_401(db, user_id)
 
 
+# =========================
+# 🔒 REQUIRED USER
+# =========================
+
 async def get_current_user(
     user: User | None = Depends(get_optional_user),
 ) -> User:
@@ -121,9 +127,9 @@ async def get_current_user(
     return user
 
 
-# ---------------------------
+# =========================
 # 🧠 IDENTITY CONTEXT
-# ---------------------------
+# =========================
 
 @dataclass
 class IdentityContext:
@@ -132,9 +138,9 @@ class IdentityContext:
     guest_token: str | None = None
 
 
-# ---------------------------
+# =========================
 # 🔥 MAIN AUTH DEPENDENCY
-# ---------------------------
+# =========================
 
 async def get_current_or_guest_user(
     request: Request,
@@ -143,12 +149,8 @@ async def get_current_or_guest_user(
     db: AsyncSession = Depends(get_session),
 ) -> IdentityContext:
 
-    user: User | None = None
-    is_guest = False
-    guest_token: str | None = None
-
     # ---------------------------
-    # ✅ ACCESS TOKEN (PRIORITY)
+    # ✅ ACCESS TOKEN (PRIMARY)
     # ---------------------------
     if access_credentials:
         if access_credentials.scheme.lower() != "bearer":
@@ -157,34 +159,20 @@ async def get_current_or_guest_user(
         user_id = _decode_token(access_credentials.credentials, expected_type="access")
         user = await _load_user_or_401(db, user_id)
 
+        request.state.user = user
+        return IdentityContext(user=user, is_guest=False, guest_token=None)
+
     # ---------------------------
-    # 🟡 EXISTING GUEST TOKEN
+    # 🟡 GUEST TOKEN (EXPLICIT ONLY)
     # ---------------------------
-    elif x_guest_token:
+    if x_guest_token:
         user_id = _decode_token(x_guest_token, expected_type="guest")
         user = await _load_user_or_401(db, user_id)
-        is_guest = True
-        guest_token = x_guest_token
+
+        request.state.user = user
+        return IdentityContext(user=user, is_guest=True, guest_token=x_guest_token)
 
     # ---------------------------
-    # 🆕 CREATE NEW GUEST
+    # 🔥 NO TOKEN → REJECT
     # ---------------------------
-    else:
-        user = User(account_type="home")
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
-
-        is_guest = True
-        guest_token = create_guest_token(user.id)
-
-    # ---------------------------
-    # 🔥 CRITICAL (RATE LIMITING)
-    # ---------------------------
-    request.state.user = user
-
-    return IdentityContext(
-        user=user,
-        is_guest=is_guest,
-        guest_token=guest_token,
-    )
+    raise _credentials_exception("Authentication required")
