@@ -25,6 +25,12 @@ export type ChatResponse = {
   guest_token?: string | null;
 };
 
+export type SessionMessage = {
+  role: "user" | "assistant";
+  content: string;
+  bundle?: AssetBundle | null; // ✅ FIX
+};
+
 /* =========================
 🔐 STORAGE
 ========================= */
@@ -33,6 +39,7 @@ const STORAGE = {
   TOKEN: "vizzy_token",
   GUEST: "vizzy_guest_token",
   SESSION: "vizzy_session_id",
+  USER: "vizzy_user_id",
 };
 
 function get(key: string) {
@@ -56,6 +63,7 @@ function clearIdentity() {
   remove(STORAGE.TOKEN);
   remove(STORAGE.GUEST);
   remove(STORAGE.SESSION);
+  remove(STORAGE.USER);
 }
 
 /* =========================
@@ -93,7 +101,7 @@ export async function register(body: {
   email: string;
   password: string;
   name?: string;
-}): Promise<{ access_token: string; user_id: string }> {
+}) {
   const r = await fetch(`${API}/api/v1/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -106,6 +114,7 @@ export async function register(body: {
 
   clearIdentity();
   set(STORAGE.TOKEN, data.access_token);
+  set(STORAGE.USER, data.user_id);
 
   window.location.reload();
 
@@ -115,7 +124,7 @@ export async function register(body: {
 export async function login(body: {
   email: string;
   password: string;
-}): Promise<{ access_token: string; user_id: string }> {
+}) {
   const r = await fetch(`${API}/api/v1/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -128,6 +137,7 @@ export async function login(body: {
 
   clearIdentity();
   set(STORAGE.TOKEN, data.access_token);
+  set(STORAGE.USER, data.user_id);
 
   window.location.reload();
 
@@ -135,10 +145,10 @@ export async function login(body: {
 }
 
 /* =========================
-👤 GUEST (EXPLICIT ONLY)
+👤 GUEST
 ========================= */
 
-export async function createGuest(): Promise<{ guest_token: string }> {
+export async function createGuest() {
   const r = await fetch(`${API}/api/v1/auth/guest`, {
     method: "POST",
   });
@@ -149,6 +159,7 @@ export async function createGuest(): Promise<{ guest_token: string }> {
 
   clearIdentity();
   set(STORAGE.GUEST, data.guest_token);
+  set(STORAGE.USER, data.user_id);
 
   window.location.reload();
 
@@ -184,11 +195,77 @@ export async function sendChat(body: {
 
   const data = await r.json();
 
-  if (data?.session_id) {
-    set(STORAGE.SESSION, data.session_id);
-  }
+  if (data?.session_id) set(STORAGE.SESSION, data.session_id);
+  if (data?.user_id) set(STORAGE.USER, data.user_id);
 
   return data;
+}
+
+/* =========================
+📚 SESSIONS
+========================= */
+
+export async function getUserSessions() {
+  const userId = get(STORAGE.USER);
+  if (!userId) return [];
+
+  const r = await fetch(`${API}/api/v1/users/${userId}/sessions`, {
+    headers: authHeaders(),
+  });
+
+  if (r.status === 401) {
+    clearIdentity();
+    window.location.reload();
+  }
+
+  if (!r.ok) throw new Error("failed to fetch sessions");
+
+  return r.json();
+}
+
+/* =========================
+🔥 SESSION MESSAGES (FIXED)
+========================= */
+
+export async function getSessionMessages(
+  sessionId: string
+): Promise<SessionMessage[]> {
+  if (!sessionId) return [];
+
+  const r = await fetch(
+    `${API}/api/v1/sessions/${sessionId}/messages`,
+    {
+      headers: authHeaders(),
+    }
+  );
+
+  if (r.status === 401) {
+    clearIdentity();
+    window.location.reload();
+  }
+
+  if (!r.ok) {
+    console.error("session messages failed:", r.status);
+    return [];
+  }
+
+  const data = await r.json();
+
+  if (!Array.isArray(data)) return [];
+
+  return data.map((m: any) => ({
+    role: m.role === "user" ? "user" : "assistant",
+    content: m.content ?? "",
+    bundle: m.bundle || null, // 🔥 FIX
+  }));
+}
+
+/* =========================
+🆕 SESSION CONTROL
+========================= */
+
+export function clearSession() {
+  remove(STORAGE.SESSION);
 }
 
 /* =========================
@@ -218,7 +295,7 @@ export async function uploadFile(file: File): Promise<Attachment> {
 }
 
 /* =========================
-👍 FEEDBACK (FIXED)
+👍 FEEDBACK
 ========================= */
 
 export async function sendFeedback(body: {
@@ -226,10 +303,10 @@ export async function sendFeedback(body: {
   bundle_id: string;
   chosen_variant?: number;
   feedback?: string;
-}): Promise<void> {
+}) {
   const sessionId = get(STORAGE.SESSION);
-
   const finalSessionId = body.session_id || sessionId;
+
   if (!finalSessionId) return;
 
   await fetch(`${API}/api/v1/feedback`, {
@@ -240,4 +317,36 @@ export async function sendFeedback(body: {
       session_id: finalSessionId,
     }),
   });
+}
+
+/* =========================
+🖼️ ASSETS (FIXED)
+========================= */
+
+export async function getUserAssets() {
+  const userId = get(STORAGE.USER);
+  if (!userId) return [];
+
+  const res = await fetch(
+    `${API}/api/v1/users/${userId}/assets`,
+    {
+      headers: authHeaders(), // ✅ FIX
+    }
+  );
+
+  if (!res.ok) throw new Error("Failed to fetch assets");
+
+  return res.json();
+}
+
+export async function saveAsset(assetId: string) {
+  const res = await fetch(
+    `${API}/api/v1/assets/${assetId}/save`,
+    {
+      method: "POST",
+      headers: authHeaders(), // ✅ FIX
+    }
+  );
+
+  if (!res.ok) throw new Error("Failed to save asset");
 }
