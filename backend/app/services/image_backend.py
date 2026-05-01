@@ -68,8 +68,10 @@ class PollinationsBackend:
 
         Rate limiting and retry are handled by the caller via
         ``rate_limited_image_call`` — this method does ONE attempt.
+        Each call gets a fresh random seed to avoid duplicate request rejection.
         """
-        seed = seed if seed is not None else random.randint(1, 2**31 - 1)
+        # Always use a fresh seed — prevents identical retries from being cached/rejected
+        seed = random.randint(1, 2**31 - 1)
         url = (
             f"https://image.pollinations.ai/prompt/{quote(prompt)}"
             f"?width={width}&height={height}&model=flux&nologo=true&seed={seed}"
@@ -101,21 +103,23 @@ class PollinationsBackend:
         prompt: str,
         **kwargs,
     ) -> bytes:
-        """Generate with full rate limiting, retry, and placeholder fallback.
-
-        This is the method pipelines should call.
-        """
+        """Generate with full rate limiting, retry, and placeholder fallback."""
         from app.core.rate_control import rate_limited_image_call
 
         try:
-            return await rate_limited_image_call(self.generate, prompt, **kwargs)
+            result = await rate_limited_image_call(self.generate, prompt, **kwargs)
+            logger.info(
+                "image_success",
+                extra={"event": "image_success", "prompt_len": len(prompt)},
+            )
+            return result
         except Exception as exc:
             logger.error(
-                "image_generation_failed_using_placeholder",
+                "image_fallback_used",
                 extra={
-                    "event": "image_generation_failed",
+                    "event": "image_fallback_used",
                     "error": str(exc)[:300],
-                    "prompt": prompt[:100],
+                    "prompt_len": len(prompt),
                 },
             )
             return _placeholder_image(
