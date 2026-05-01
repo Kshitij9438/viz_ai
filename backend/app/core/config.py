@@ -31,6 +31,10 @@ class Settings(BaseSettings):
 
     # Railway injects PORT automatically
     PORT: int = int(os.environ.get("PORT", "8000"))
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "")
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
+    GUEST_JWT_EXPIRE_HOURS: int = int(os.environ.get("GUEST_JWT_EXPIRE_HOURS", "48"))
 
 
 settings = Settings()

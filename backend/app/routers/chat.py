@@ -7,6 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import IdentityContext, get_current_or_guest_user
 from app.core.db import AsyncSessionLocal, get_session
 from app.memory.memory import (
     end_session_summary,
@@ -26,7 +27,7 @@ class Attachment(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    user_id: Optional[str] = None
+    user_id: Optional[str] = None  # deprecated, ignored
     session_id: Optional[str] = None
     message: str
     attachments: list[Attachment] = []
@@ -38,9 +39,11 @@ class ChatResponse(BaseModel):
     tool_call: Optional[dict[str, Any]] = None
     session_id: str
     user_id: str
+    guest_token: Optional[str] = None
 
 
 async def _get_or_create_user(db: AsyncSession, user_id: str | None) -> User:
+    # Kept for backward compat — no longer called by chat()
     if user_id:
         u = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
         if u:
@@ -54,6 +57,8 @@ async def _get_or_create_session(db: AsyncSession, session_id: str | None, user_
     if session_id:
         s = (await db.execute(select(SessionModel).where(SessionModel.id == session_id))).scalar_one_or_none()
         if s:
+            if s.user_id != user_id:
+                raise HTTPException(status_code=403, detail="Session does not belong to authenticated identity")
             return s
     s = SessionModel(user_id=user_id)
     db.add(s); await db.commit(); await db.refresh(s)
@@ -68,8 +73,13 @@ async def _bg_taste_update(user_id: str, prompt_summary: str, feedback: str | No
 
 
 @router.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_session)) -> ChatResponse:
-    user = await _get_or_create_user(db, req.user_id)
+async def chat(
+    req: ChatRequest,
+    bg: BackgroundTasks,
+    identity: IdentityContext = Depends(get_current_or_guest_user),
+    db: AsyncSession = Depends(get_session),
+) -> ChatResponse:
+    user = identity.user
     session = await _get_or_create_session(db, req.session_id, user.id)
 
     result = await converse(
@@ -89,6 +99,7 @@ async def chat(req: ChatRequest, bg: BackgroundTasks, db: AsyncSession = Depends
         tool_call=result.get("tool_call"),
         session_id=session.id,
         user_id=user.id,
+        guest_token=identity.guest_token,
     )
 
 
@@ -100,7 +111,7 @@ async def _bg_compress(session_id: str) -> None:
 
 
 class FeedbackRequest(BaseModel):
-    user_id: str
+    user_id: Optional[str] = None  # deprecated, ignored
     session_id: str
     bundle_id: str
     chosen_variant: Optional[int] = None
@@ -108,8 +119,24 @@ class FeedbackRequest(BaseModel):
 
 
 @router.post("/feedback")
-async def feedback(req: FeedbackRequest, bg: BackgroundTasks, db: AsyncSession = Depends(get_session)) -> dict:
+async def feedback(
+    req: FeedbackRequest,
+    bg: BackgroundTasks,
+    identity: IdentityContext = Depends(get_current_or_guest_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
     from app.models.models import Asset
+
+    current_user = identity.user
+    s = (await db.execute(select(SessionModel).where(SessionModel.id == req.session_id))).scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if s.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    bundle_asset = (await db.execute(select(Asset).where(Asset.bundle_id == req.bundle_id).limit(1))).scalar_one_or_none()
+    if bundle_asset and bundle_asset.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     if req.chosen_variant:
         res = await db.execute(
@@ -117,15 +144,15 @@ async def feedback(req: FeedbackRequest, bg: BackgroundTasks, db: AsyncSession =
         )
         a = res.scalar_one_or_none()
         if a:
+            if a.user_id != current_user.id:
+                raise HTTPException(status_code=403, detail="Forbidden")
             a.selected = True
-            s = (await db.execute(select(SessionModel).where(SessionModel.id == req.session_id))).scalar_one_or_none()
-            if s:
-                s.active_asset_id = a.id
+            s.active_asset_id = a.id
             await db.commit()
 
     bg.add_task(
         _bg_taste_update_with_variant,
-        req.user_id, req.bundle_id, req.chosen_variant, req.feedback,
+        current_user.id, req.bundle_id, req.chosen_variant, req.feedback,
     )
     return {"ok": True}
 
@@ -142,9 +169,16 @@ async def _bg_taste_update_with_variant(user_id: str, bundle_id: str, variant: i
 
 
 @router.post("/sessions/{session_id}/end")
-async def end_session(session_id: str, db: AsyncSession = Depends(get_session)) -> dict:
+async def end_session(
+    session_id: str,
+    identity: IdentityContext = Depends(get_current_or_guest_user),
+    db: AsyncSession = Depends(get_session),
+) -> dict:
+    current_user = identity.user
     s = (await db.execute(select(SessionModel).where(SessionModel.id == session_id))).scalar_one_or_none()
     if not s:
-        raise HTTPException(404)
+        raise HTTPException(status_code=404, detail="Session not found")
+    if s.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
     await end_session_summary(db, s)
     return {"ok": True, "summary": s.summary}

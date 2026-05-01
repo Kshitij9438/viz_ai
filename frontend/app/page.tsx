@@ -6,6 +6,8 @@ import { AssetGrid } from "@/components/AssetGrid";
 import {
   Attachment,
   AssetBundle,
+  login,
+  register,
   sendChat,
   sendFeedback,
   uploadFile,
@@ -31,12 +33,22 @@ export default function Page() {
   const [busy, setBusy] = useState(false);
   const [sessionId, setSessionId] = useState<string | undefined>();
   const [userId, setUserId] = useState<string | undefined>();
+  const [token, setToken] = useState<string | null>(null);
+  const [guestMode, setGuestMode] = useState(false);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setUserId(localStorage.getItem("vizzy_user_id") || undefined);
     setSessionId(localStorage.getItem("vizzy_session_id") || undefined);
+    const storedToken = localStorage.getItem("vizzy_token");
+    const storedGuest = localStorage.getItem("vizzy_guest_token");
+    setToken(storedToken);
+    setGuestMode(Boolean(storedGuest));
   }, []);
 
   useEffect(() => {
@@ -53,7 +65,6 @@ export default function Page() {
     setBusy(true);
     try {
       const res = await sendChat({
-        user_id: userId,
         session_id: sessionId,
         message: text,
         attachments,
@@ -87,9 +98,8 @@ export default function Page() {
   }
 
   async function pickVariant(bundle: AssetBundle, variant: number) {
-    if (!userId || !sessionId) return;
+    if (!sessionId) return;
     await sendFeedback({
-      user_id: userId,
       session_id: sessionId,
       bundle_id: bundle.bundle_id,
       chosen_variant: variant,
@@ -97,11 +107,101 @@ export default function Page() {
     setInput((s) => (s ? s : `I like number ${variant}.`));
   }
 
+  async function handleAuth() {
+    try {
+      setAuthError("");
+      const fn = authMode === "login" ? login : register;
+      const res = await fn({ email: authEmail, password: authPassword });
+      localStorage.setItem("vizzy_token", res.access_token);
+      localStorage.setItem("vizzy_user_id", res.user_id);
+      localStorage.removeItem("vizzy_guest_token");
+      setToken(res.access_token);
+      setUserId(res.user_id);
+    } catch (e: any) {
+      setAuthError(e.message);
+    }
+  }
+
+  if (!token && !guestMode) {
+    return (
+      <main className="mx-auto flex h-screen max-w-3xl flex-col">
+        <header className="border-b border-stone-200 px-6 py-4">
+          <h1 className="text-xl font-semibold tracking-tight">Vizzy</h1>
+          <p className="text-xs text-stone-500">conversational creative OS</p>
+        </header>
+        <div className="flex flex-1 items-center justify-center px-4">
+          <div className="w-full max-w-md rounded-2xl border border-stone-200 p-6">
+            <h2 className="mb-4 text-lg font-medium text-stone-900">
+              {authMode === "login" ? "Login" : "Create account"}
+            </h2>
+            <div className="mb-3 flex gap-2">
+              <button
+                onClick={() => setAuthMode("login")}
+                className={`rounded-xl px-3 py-1.5 text-sm ${authMode === "login" ? "bg-stone-900 text-white" : "border border-stone-300 text-stone-700"}`}
+              >
+                Login
+              </button>
+              <button
+                onClick={() => setAuthMode("register")}
+                className={`rounded-xl px-3 py-1.5 text-sm ${authMode === "register" ? "bg-stone-900 text-white" : "border border-stone-300 text-stone-700"}`}
+              >
+                Register
+              </button>
+            </div>
+            <input
+              type="email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              placeholder="Email"
+              className="mb-2 w-full rounded-xl border border-stone-300 px-3 py-2 outline-none focus:border-stone-500"
+            />
+            <input
+              type="password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              placeholder="Password"
+              className="mb-2 w-full rounded-xl border border-stone-300 px-3 py-2 outline-none focus:border-stone-500"
+            />
+            {authError && <p className="mb-2 text-sm text-red-600">{authError}</p>}
+            <button
+              onClick={handleAuth}
+              disabled={busy || !authEmail.trim() || !authPassword.trim()}
+              className="rounded-xl bg-stone-900 px-4 py-2 text-white disabled:opacity-40"
+            >
+              {authMode === "login" ? "Login" : "Register"}
+            </button>
+            <button
+              onClick={() => setGuestMode(true)}
+              className="ml-2 rounded-xl border border-stone-300 px-4 py-2 text-sm hover:bg-stone-100"
+            >
+              Continue as guest
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="mx-auto flex h-screen max-w-3xl flex-col">
-      <header className="border-b border-stone-200 px-6 py-4">
-        <h1 className="text-xl font-semibold tracking-tight">Vizzy</h1>
-        <p className="text-xs text-stone-500">conversational creative OS</p>
+      <header className="flex items-center justify-between border-b border-stone-200 px-6 py-4">
+        <div>
+          <h1 className="text-xl font-semibold tracking-tight">Vizzy</h1>
+          <p className="text-xs text-stone-500">conversational creative OS</p>
+        </div>
+        <button
+          onClick={() => {
+            localStorage.removeItem("vizzy_token");
+            localStorage.removeItem("vizzy_user_id");
+            localStorage.removeItem("vizzy_guest_token");
+            localStorage.removeItem("vizzy_session_id");
+            setToken(null);
+            setGuestMode(false);
+          }}
+          className="rounded-xl border border-stone-300 px-3 py-2 text-sm hover:bg-stone-100"
+        >
+          Logout
+        </button>
       </header>
 
       <div className="flex-1 space-y-5 overflow-y-auto px-6 py-6">

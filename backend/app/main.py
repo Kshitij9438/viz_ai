@@ -9,12 +9,14 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.db import init_db
-from app.routers import assets, chat, profiles, uploads
+from app.routers import assets, auth, chat, profiles, uploads
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+    if not settings.JWT_SECRET_KEY or len(settings.JWT_SECRET_KEY) < 32:
+        raise RuntimeError("JWT_SECRET_KEY must be set and at least 32 characters long.")
     await init_db()
     yield
 
@@ -34,6 +36,7 @@ app.add_middleware(
 
 app.mount("/storage", StaticFiles(directory=settings.STORAGE_DIR), name="storage")
 
+app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(uploads.router)
 app.include_router(profiles.router)

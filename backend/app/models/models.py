@@ -135,3 +135,12 @@ class SessionSummary(Base):
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"))
     summary: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+
+
+class UserCredential(Base):
+    __tablename__ = "user_credentials"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: _uid("cred"))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), unique=True)
+    hashed_password: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
