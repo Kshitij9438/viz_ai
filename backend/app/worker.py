@@ -116,8 +116,10 @@ class JobWorker:
             try:
                 job_id = await dequeue_job(timeout=5)
                 if job_id is None:
-                    # Timeout — no jobs, loop again
+                    # No jobs in queue — sleep before polling again
+                    # (RPOP is non-blocking, so we must throttle ourselves)
                     consecutive_failures = 0
+                    await asyncio.sleep(2)
                     continue
 
                 consecutive_failures = 0

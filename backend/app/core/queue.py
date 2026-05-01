@@ -150,7 +150,11 @@ async def enqueue_job(job_id: str) -> bool:
 
 
 async def dequeue_job(timeout: int = 5) -> str | None:
-    """Blocking pop from the queue.  Returns a job_id or ``None`` on timeout.
+    """Non-blocking pop from the queue.  Returns a job_id or ``None``.
+
+    Uses RPOP instead of BRPOP for Upstash compatibility — Upstash is
+    serverless Redis and does not support long-lived blocking commands.
+    The worker loop handles polling via asyncio.sleep.
 
     Raises ``ConnectionError`` on Redis disconnect so the worker loop can
     handle reconnection.
@@ -159,11 +163,8 @@ async def dequeue_job(timeout: int = 5) -> str | None:
     if r is None:
         raise ConnectionError("Redis unavailable for dequeue")
 
-    result = await r.brpop(QUEUE_KEY, timeout=timeout)
-    if result is None:
-        return None
-    # brpop returns (key, value)
-    return result[1]
+    result = await r.rpop(QUEUE_KEY)
+    return result
 
 
 # ---------------------------------------------------------------------------
