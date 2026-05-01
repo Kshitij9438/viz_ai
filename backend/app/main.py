@@ -10,6 +10,9 @@ from app.core.config import settings
 from app.core.db import init_db
 from app.routers import assets, auth, chat, profiles, uploads
 
+from app.core.limiter import limiter, rate_limit_handler
+from slowapi.errors import RateLimitExceeded
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -24,6 +27,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Vizzy AI", version="0.1.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 
 # Parse FRONTEND_ORIGIN as comma-separated to support multiple origins
 _origins = [o.strip() for o in settings.FRONTEND_ORIGIN.split(",") if o.strip()]

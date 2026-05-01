@@ -16,7 +16,8 @@ from app.memory.memory import (
 )
 from app.models.models import Session as SessionModel, User
 from app.services.conversation import converse
-
+from app.core.limiter import limiter
+from fastapi import Request
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 
 
@@ -71,9 +72,10 @@ async def _bg_taste_update(user_id: str, prompt_summary: str, feedback: str | No
             db, user_id, prompt_summary=prompt_summary, chosen_variant=None, feedback=feedback,
         )
 
-
 @router.post("/chat", response_model=ChatResponse)
+@limiter.limit("20/minute")
 async def chat(
+    request: Request,
     req: ChatRequest,
     bg: BackgroundTasks,
     identity: IdentityContext = Depends(get_current_or_guest_user),
@@ -182,3 +184,11 @@ async def end_session(
         raise HTTPException(status_code=403, detail="Forbidden")
     await end_session_summary(db, s)
     return {"ok": True, "summary": s.summary}
+
+from fastapi import Request
+from app.core.limiter import limiter
+
+@router.get("/rate-test")
+@limiter.limit("3/minute")  # small for testing
+async def rate_test(request: Request):
+    return {"ok": True}
