@@ -28,7 +28,8 @@ async def _gen_one(
     reference_image_url: str | None = None,
     reference_strength: float | None = None,
 ) -> bytes:
-    return await image_backend.generate(
+    """Generate a single image via the rate-limited backend."""
+    return await image_backend.generate_safe(
         prompt,
         negative_prompt=negative_prompt,
         width=width,
@@ -39,6 +40,12 @@ async def _gen_one(
 
 
 async def _gen_many(prompt: str, n: int, **kw) -> list[bytes]:
+    """Generate n images with bounded concurrency (Semaphore(2)).
+
+    Each call goes through the image semaphore in generate_safe(),
+    so at most 2 image API requests are in-flight at once.
+    This prevents Pollinations 429 spam while still allowing parallelism.
+    """
     return await asyncio.gather(*[_gen_one(prompt, **kw) for _ in range(n)])
 
 

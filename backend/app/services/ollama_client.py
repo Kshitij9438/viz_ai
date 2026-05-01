@@ -1,11 +1,19 @@
-"""GitHub Models client — drop-in replacement for OllamaClient."""
+"""GitHub Models client — drop-in replacement for OllamaClient.
+
+All LLM calls are wrapped with rate_limited_llm_call for semaphore-controlled
+concurrency (max 5 concurrent) and retry with exponential backoff.
+"""
 from __future__ import annotations
 
+import asyncio
 import base64
+import logging
 from typing import Any
 
 from openai import AsyncOpenAI
 from app.core.config import settings
+
+logger = logging.getLogger("vizzy.llm")
 
 
 class GitHubModelsClient:
@@ -16,15 +24,14 @@ class GitHubModelsClient:
             timeout=settings.LLM_TIMEOUT_SECONDS,
         )
 
-    async def chat(
+    async def _raw_chat(
         self,
         messages: list[dict[str, Any]],
         *,
         tools: list[dict] | None = None,
         model: str | None = None,
-        stream: bool = False,
-        options: dict | None = None,  # ignored, kept for compatibility
     ) -> dict:
+        """Single-attempt chat completion (no retry, no semaphore)."""
         kwargs: dict[str, Any] = {
             "model": model or settings.GITHUB_MODEL,
             "messages": messages,
@@ -33,7 +40,10 @@ class GitHubModelsClient:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        response = await self.client.chat.completions.create(**kwargs)
+        response = await asyncio.wait_for(
+            self.client.chat.completions.create(**kwargs),
+            timeout=settings.LLM_TIMEOUT_SECONDS + 5,  # hard ceiling above SDK timeout
+        )
         msg = response.choices[0].message
 
         # Normalize to the same dict shape conversation.py already expects
@@ -56,37 +66,69 @@ class GitHubModelsClient:
             }
         }
 
-    async def caption_image(self, image_bytes: bytes) -> str:
-        """Use GPT-4.1-mini vision to caption an uploaded image."""
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict] | None = None,
+        model: str | None = None,
+        stream: bool = False,
+        options: dict | None = None,  # ignored, kept for compatibility
+    ) -> dict:
+        """Rate-limited chat completion with retry."""
+        from app.core.rate_control import rate_limited_llm_call
+        return await rate_limited_llm_call(
+            self._raw_chat, messages, tools=tools, model=model,
+        )
+
+    async def _raw_caption(self, image_bytes: bytes) -> str:
+        """Single-attempt image caption."""
         b64 = base64.b64encode(image_bytes).decode("ascii")
-        response = await self.client.chat.completions.create(
-            model=settings.GITHUB_VISION_MODEL,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    },
-                    {
-                        "type": "text",
-                        "text": "Describe this image in detail for a creative AI assistant. Focus on subject, mood, lighting, colors, and style. Two sentences.",
-                    },
-                ],
-            }],
-            max_tokens=200,
-            timeout=settings.LLM_TIMEOUT_SECONDS,
+        response = await asyncio.wait_for(
+            self.client.chat.completions.create(
+                model=settings.GITHUB_VISION_MODEL,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        },
+                        {
+                            "type": "text",
+                            "text": "Describe this image in detail for a creative AI assistant. Focus on subject, mood, lighting, colors, and style. Two sentences.",
+                        },
+                    ],
+                }],
+                max_tokens=200,
+            ),
+            timeout=settings.LLM_TIMEOUT_SECONDS + 5,
+        )
+        return response.choices[0].message.content.strip()
+
+    async def caption_image(self, image_bytes: bytes) -> str:
+        """Rate-limited image caption with retry."""
+        from app.core.rate_control import rate_limited_llm_call
+        return await rate_limited_llm_call(self._raw_caption, image_bytes)
+
+    async def _raw_complete(self, prompt: str, model: str | None = None) -> str:
+        """Single-attempt text completion."""
+        response = await asyncio.wait_for(
+            self.client.chat.completions.create(
+                model=model or settings.GITHUB_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+            ),
+            timeout=settings.LLM_TIMEOUT_SECONDS + 5,
         )
         return response.choices[0].message.content.strip()
 
     async def complete(self, prompt: str, model: str | None = None) -> str:
-        response = await self.client.chat.completions.create(
-            model=model or settings.GITHUB_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            timeout=settings.LLM_TIMEOUT_SECONDS,
+        """Rate-limited text completion with retry."""
+        from app.core.rate_control import rate_limited_llm_call
+        return await rate_limited_llm_call(
+            self._raw_complete, prompt, model=model,
         )
-        return response.choices[0].message.content.strip()
 
 
 ollama = GitHubModelsClient()  # keeps the same import name everywhere

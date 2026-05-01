@@ -128,6 +128,31 @@ class GenerationJob(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
+class Job(Base):
+    """Lightweight async job record — single source of truth for job state.
+
+    Redis is used only as a transport queue (LPUSH/BRPOP of job.id).
+    All state (status, result, error) lives here in PostgreSQL.
+    Worker rebuilds full PipelineContext from session_id / user_id at
+    execution time — no serialised payload blob.
+    """
+    __tablename__ = "jobs"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: _uid("job"))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"))
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"))
+    type: Mapped[str] = mapped_column(String, default="generation")  # generation | chat
+    message: Mapped[str] = mapped_column(Text)  # original user message
+    attachments_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    intent_data: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending", index=True)
+    result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class SessionSummary(Base):
     __tablename__ = "session_summaries"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: _uid("sm"))

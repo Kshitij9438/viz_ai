@@ -2,24 +2,25 @@
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import IdentityContext, get_current_or_guest_user
 from app.core.db import AsyncSessionLocal, get_session
-from app.core.queue import enqueue_job
+from app.core.limiter import limiter
+from app.core.queue import check_dedup, enqueue_job, set_dedup
 from app.memory.memory import (
     end_session_summary,
     maybe_compress_history,
     update_taste_after_feedback,
 )
-from app.models.models import Session as SessionModel, User
+from app.models.models import Job, Session as SessionModel, User
 from app.services.storage import public_asset_url
 from app.services.conversation import converse
-from app.core.limiter import limiter
-from fastapi import Request
+from app.services.intent_engine import classify_intent
+
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 
 
@@ -46,6 +47,8 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+    job_id: Optional[str] = None
+    job_status: Optional[str] = None
     asset_bundle: Optional[dict[str, Any]] = None
     creative_output: Optional[dict[str, Any]] = None
     intent: Optional[dict[str, Any]] = None
@@ -114,6 +117,17 @@ def _normalize_creative_output(output: dict[str, Any] | None) -> dict[str, Any] 
     return normalized
 
 
+# ---------------------------------------------------------------------------
+# Intent type mapping
+# ---------------------------------------------------------------------------
+
+_GENERATION_INTENTS = {"image", "story", "video", "moodboard", "campaign", "edit"}
+
+
+# ---------------------------------------------------------------------------
+# /chat endpoint — hybrid sync/async
+# ---------------------------------------------------------------------------
+
 @router.post("/chat", response_model=ChatResponse)
 @limiter.limit("20/minute")
 async def chat(
@@ -125,41 +139,130 @@ async def chat(
     user = identity.user
     session = await _get_or_create_session(db, req.session_id, user.id)
 
+    # ---- Step 1: Classify intent (1 LLM call, ~1-3s, acceptable) ----
+    from app.memory.memory import get_or_create_taste, get_business, get_recent_messages
+    taste = await get_or_create_taste(db, session.user_id)
+    business = await get_business(db, session.user_id)
+    recent_msgs = await get_recent_messages(db, session.id)
+
     try:
-        result = await converse(
-            db, session=session, user_message=req.message,
+        intent = await classify_intent(
+            message=req.message,
             attachments=[a.model_dump() for a in req.attachments] if req.attachments else None,
+            recent_messages=recent_msgs,
+            taste=taste,
+            business=business,
         )
     except Exception:
-        result = {
-            "reply": "I hit a temporary issue while creating that. Your session is safe. Please try again in a moment.",
-            "asset_bundle": None,
-            "creative_output": None,
-            "intent": None,
-            "tool_call": None,
-        }
+        # Fallback to regex-based classification (never crash)
+        from app.services.intent_engine import _fallback_intent
+        intent = _fallback_intent(req.message, [a.model_dump() for a in req.attachments] if req.attachments else None)
 
-    await enqueue_job("compress_history", session.id)
-    asset_bundle = _normalize_bundle(result.get("asset_bundle"))
-    creative_output = _normalize_creative_output(result.get("creative_output"))
+    # ---- Step 2: Chat-only (no generation) → sync fast path ----
+    if intent.intent not in _GENERATION_INTENTS:
+        try:
+            result = await converse(
+                db, session=session, user_message=req.message,
+                attachments=[a.model_dump() for a in req.attachments] if req.attachments else None,
+            )
+        except Exception:
+            result = {
+                "reply": "I hit a temporary issue. Your session is safe. Please try again in a moment.",
+                "asset_bundle": None,
+                "creative_output": None,
+                "intent": None,
+                "tool_call": None,
+            }
 
-    if asset_bundle:
-        prompt_summary = asset_bundle["prompt_used"][:280]
-        queued = await enqueue_job("update_taste_profile", user.id, prompt_summary, None, req.message)
-        if not queued:
-            await _bg_taste_update(user.id, prompt_summary, req.message)
+        return ChatResponse(
+            reply=str(result.get("reply") or "Tell me more."),
+            job_id=None,
+            job_status=None,
+            asset_bundle=_normalize_bundle(result.get("asset_bundle")),
+            creative_output=_normalize_creative_output(result.get("creative_output")),
+            intent=result.get("intent"),
+            tool_call=result.get("tool_call"),
+            session_id=session.id,
+            user_id=user.id,
+            guest_token=identity.guest_token,
+        )
+
+    # ---- Step 3: Generation intent → enqueue job, return fast ----
+
+    # Dedup check
+    existing_job_id = await check_dedup(user.id, session.id, req.message)
+    if existing_job_id:
+        import logging
+        logging.getLogger("vizzy.chat").info(
+            "dedup_hit",
+            extra={"event": "dedup_hit", "job_id": existing_job_id, "user_id": user.id},
+        )
+        return ChatResponse(
+            reply=f"I'm already working on that! You can check progress.",
+            job_id=existing_job_id,
+            job_status="pending",
+            session_id=session.id,
+            user_id=user.id,
+            guest_token=identity.guest_token,
+        )
+
+    # Create Job in DB (single source of truth)
+    job = Job(
+        user_id=user.id,
+        session_id=session.id,
+        type="generation",
+        message=req.message,
+        attachments_json=[a.model_dump() for a in req.attachments] if req.attachments else None,
+        intent_data=intent.model_dump(),
+        status="pending",
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+
+    # Enqueue to Redis (transport only)
+    enqueued = await enqueue_job(job.id)
+
+    if not enqueued:
+        # Redis unavailable — return degraded response, do NOT run pipeline sync
+        return ChatResponse(
+            reply="I understood your request, but image generation is temporarily unavailable. Please try again in a moment.",
+            job_id=None,
+            job_status=None,
+            session_id=session.id,
+            user_id=user.id,
+            guest_token=identity.guest_token,
+            intent=intent.model_dump(),
+        )
+
+    # Set dedup marker
+    await set_dedup(user.id, session.id, req.message, job.id)
+
+    # Reply type mapping for friendly messages
+    _type_names = {
+        "image": "your images",
+        "story": "your story",
+        "video": "your video",
+        "moodboard": "your moodboard",
+        "campaign": "your campaign",
+        "edit": "the edit",
+    }
+    type_name = _type_names.get(intent.intent, "your creation")
 
     return ChatResponse(
-        reply=str(result.get("reply") or "Tell me more."),
-        asset_bundle=asset_bundle,
-        creative_output=creative_output,
-        intent=result.get("intent"),
-        tool_call=result.get("tool_call"),
+        reply=f"I'm working on {type_name}. This usually takes 10–30 seconds.",
+        job_id=job.id,
+        job_status="pending",
         session_id=session.id,
         user_id=user.id,
         guest_token=identity.guest_token,
+        intent=intent.model_dump(),
     )
 
+
+# ---------------------------------------------------------------------------
+# /feedback
+# ---------------------------------------------------------------------------
 
 async def _bg_compress(session_id: str) -> None:
     async with AsyncSessionLocal() as db:
@@ -207,15 +310,12 @@ async def feedback(
             s.active_asset_id = a.id
             await db.commit()
 
-    queued = await enqueue_job(
-        "update_taste_profile_for_bundle",
-        current_user.id,
-        req.bundle_id,
-        req.chosen_variant,
-        req.feedback,
-    )
-    if not queued:
+    # Taste update — best-effort in-process (non-blocking background)
+    try:
         await _bg_taste_update_with_variant(current_user.id, req.bundle_id, req.chosen_variant, req.feedback)
+    except Exception:
+        pass  # taste update is non-critical
+
     return {"ok": True}
 
 
@@ -245,8 +345,6 @@ async def end_session(
     await end_session_summary(db, s)
     return {"ok": True, "summary": s.summary}
 
-from fastapi import Request
-from app.core.limiter import limiter
 
 @router.get("/rate-test")
 @limiter.limit("3/minute")  # small for testing

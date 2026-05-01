@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     QUEUE_JOB_TIMEOUT_SECONDS: int = 180
     QUEUE_MAX_TRIES: int = 3
+    QUEUE_MAX_DEPTH: int = 100
+
+    # Worker resilience
+    WORKER_MAX_RESTARTS: int = 5
+    WORKER_RESTART_WINDOW: int = 300  # seconds
 
     # Image generation
     IMAGE_BACKEND: str = "pollinations"

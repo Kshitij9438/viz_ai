@@ -10,6 +10,27 @@ from fastapi import Request, Response
 
 
 class JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter with full event taxonomy."""
+
+    _EXTRA_KEYS = (
+        # Request lifecycle
+        "request_id", "method", "path", "status_code", "duration_ms",
+        "event", "error",
+        # Job lifecycle
+        "job_id", "attempt", "will_retry", "type",
+        "original_status", "re_enqueued",
+        # Queue & backpressure
+        "queue_depth", "max_depth", "operation",
+        # Rate control
+        "target", "max_retries", "delay_seconds", "reason",
+        # Worker
+        "consecutive_failures", "backoff_seconds",
+        "restart_count", "restarts_in_window", "window_seconds",
+        "worker_replica",
+        # Dedup
+        "user_id", "count",
+    )
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             "level": record.levelname.lower(),
@@ -17,7 +38,7 @@ class JsonFormatter(logging.Formatter):
             "logger": record.name,
             "time": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
         }
-        for key in ("request_id", "method", "path", "status_code", "duration_ms", "event", "error"):
+        for key in self._EXTRA_KEYS:
             value = getattr(record, key, None)
             if value is not None:
                 payload[key] = value
