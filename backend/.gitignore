@@ -1,16 +1,21 @@
-# ─── Python ───
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
 venv/
 .venv/
 
-# ─── Environment ───
+# Environment and secrets
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
-# ─── Database ───
+# Local data
 *.db
-
-# ─── Generated Assets ───
+*.sqlite
+*.sqlite3
 storage/

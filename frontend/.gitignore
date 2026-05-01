@@ -1,11 +1,18 @@
-# ─── Dependencies ───
+# Dependencies
 node_modules/
 
-# ─── Build Output ───
+# Next.js
 .next/
 out/
+.vercel/
 
-# ─── Environment ───
+# Environment and secrets
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

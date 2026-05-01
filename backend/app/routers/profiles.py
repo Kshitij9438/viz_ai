@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import get_current_user
+from app.core.auth import IdentityContext, get_current_or_guest_user
 from app.core.db import get_session
 from app.memory.memory import get_or_create_taste
 from app.models.models import BusinessProfile, User, UserTasteProfile
@@ -25,10 +25,10 @@ class TasteUpdate(BaseModel):
 @router.get("/{user_id}/taste-profile")
 async def get_taste(
     user_id: str,
-    current_user: User = Depends(get_current_user),
+    identity: IdentityContext = Depends(get_current_or_guest_user),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if user_id != current_user.id:
+    if user_id != identity.user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
     t = await get_or_create_taste(db, user_id)
     return {
@@ -46,10 +46,10 @@ async def get_taste(
 async def put_taste(
     user_id: str,
     body: TasteUpdate,
-    current_user: User = Depends(get_current_user),
+    identity: IdentityContext = Depends(get_current_or_guest_user),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if user_id != current_user.id:
+    if user_id != identity.user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
     t = await get_or_create_taste(db, user_id)
     for k, v in body.model_dump(exclude_none=True).items():
@@ -74,10 +74,10 @@ class BusinessUpsert(BaseModel):
 @router.get("/{user_id}/business-profile")
 async def get_business_p(
     user_id: str,
-    current_user: User = Depends(get_current_user),
+    identity: IdentityContext = Depends(get_current_or_guest_user),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if user_id != current_user.id:
+    if user_id != identity.user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
     res = await db.execute(select(BusinessProfile).where(BusinessProfile.user_id == user_id))
     b = res.scalar_one_or_none()
@@ -90,10 +90,10 @@ async def get_business_p(
 async def upsert_business(
     user_id: str,
     body: BusinessUpsert,
-    current_user: User = Depends(get_current_user),
+    identity: IdentityContext = Depends(get_current_or_guest_user),
     db: AsyncSession = Depends(get_session),
 ) -> dict:
-    if user_id != current_user.id:
+    if user_id != identity.user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
     res = await db.execute(select(BusinessProfile).where(BusinessProfile.user_id == user_id))
     b = res.scalar_one_or_none()

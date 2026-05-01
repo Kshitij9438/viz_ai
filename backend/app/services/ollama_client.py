@@ -13,6 +13,7 @@ class GitHubModelsClient:
         self.client = AsyncOpenAI(
             base_url="https://models.inference.ai.azure.com",
             api_key=settings.GITHUB_TOKEN,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
         )
 
     async def chat(
@@ -74,6 +75,7 @@ class GitHubModelsClient:
                 ],
             }],
             max_tokens=200,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
         )
         return response.choices[0].message.content.strip()
 
@@ -82,6 +84,7 @@ class GitHubModelsClient:
             model=model or settings.GITHUB_MODEL,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
         )
         return response.choices[0].message.content.strip()
 

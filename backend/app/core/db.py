@@ -1,6 +1,9 @@
+from __future__ import annotations
+
+import ssl
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
-import ssl
 
 from app.core.config import settings
 
@@ -9,21 +12,21 @@ class Base(DeclarativeBase):
     pass
 
 
-# 🔥 SSL setup (required for Supabase)
-ssl_context = ssl.create_default_context()
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
+def _connect_args(database_url: str) -> dict:
+    if database_url.startswith("postgresql"):
+        return {
+            "ssl": ssl.create_default_context(),
+            "statement_cache_size": 0,
+        }
+    return {}
 
 
-# 🔥 CRITICAL: disable prepared statements for PgBouncer compatibility
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=False,
     future=True,
-    connect_args={
-        "ssl": ssl_context,
-        "statement_cache_size": 0,  # 🚨 FIXES YOUR ERROR
-    },
+    pool_pre_ping=True,
+    connect_args=_connect_args(settings.DATABASE_URL),
 )
 
 
@@ -40,7 +43,6 @@ async def get_session() -> AsyncSession:
 
 
 async def init_db() -> None:
-    # Import models so they register on Base.metadata
     from app.models import models  # noqa: F401
 
     async with engine.begin() as conn:

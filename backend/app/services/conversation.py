@@ -15,6 +15,8 @@ from app.memory.memory import (
 )
 from app.models.models import BusinessProfile, Message, UserTasteProfile
 from app.pipelines.router import run_generation
+from app.services.intent_engine import classify_intent
+from app.services.pipeline_engine import PipelineContext, execute_pipeline
 from app.services.generate_tool import GENERATE_TOOL_SCHEMA, GenerateParams
 from app.services.ollama_client import ollama
 
@@ -242,116 +244,58 @@ async def converse(
         role="user",
         content=user_content,
         sequence=user_seq,
+        attachments=attachments,
     ))
     session.message_count += 1
     await db.commit()
 
-    # -------- AGENT LOOP -------- #
-    MAX_STEPS = 5
-    asset_bundle = None
-    captured_call = None
-    assistant_text = ""
+    # -------- CREATIVE OS INTENT + PIPELINE -------- #
+    intent = await classify_intent(
+        message=user_message,
+        attachments=attachments,
+        recent_messages=recent_msgs,
+        taste=taste,
+        business=business,
+    )
 
-    for _ in range(MAX_STEPS):
-
-        resp = await ollama.chat(
-            messages=messages,
-            tools=[GENERATE_TOOL_SCHEMA],
-        )
-
-        msg = resp.get("message", {})
-        assistant_text = (msg.get("content") or "").strip()
-        raw_tool_calls: list[dict] = msg.get("tool_calls") or []
-
-        tool_calls = [_normalize_tool_call(c) for c in raw_tool_calls]
-
-        assistant_entry: dict[str, Any] = {
-            "role": "assistant",
-            "content": assistant_text,
-        }
-
-        if tool_calls:
-            assistant_entry["tool_calls"] = tool_calls
-
-        messages.append(assistant_entry)
-
-        asst_seq = await _next_seq(db, session.id)
-        db.add(Message(
+    result = await execute_pipeline(
+        PipelineContext(
+            db=db,
+            user_id=session.user_id,
             session_id=session.id,
-            role="assistant",
-            content=assistant_text,
-            tool_calls={"calls": tool_calls} if tool_calls else None,
-            sequence=asst_seq,
-        ))
+            message=user_message,
+            attachments=attachments,
+            recent_messages=recent_msgs,
+            taste=taste,
+            business=business,
+            session_last_prompt=session.last_prompt,
+        ),
+        intent,
+    )
 
-        await db.commit()
+    if result.primary_bundle:
+        session.last_prompt = result.primary_bundle.get("prompt_used") or result.memory_signal
 
-        if not tool_calls:
-            break
-
-        # -------- TOOL EXECUTION -------- #
-        for call in tool_calls:
-            call_id: str = call["id"]
-            fn = call.get("function", {})
-
-            if fn.get("name") != "generate":
-                tool_result = json.dumps({"error": f"Unknown tool: {fn.get('name')}"})
-            else:
-                args = fn.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-
-                try:
-                    params = GenerateParams.model_validate(args)
-                except Exception as exc:
-                    tool_result = json.dumps({"error": f"Invalid arguments: {exc}"})
-                else:
-                    captured_call = {"name": "generate", "arguments": params.model_dump()}
-
-                    try:
-                        asset_bundle = await run_generation(
-                            db,
-                            params=params,
-                            user_id=session.user_id,
-                            session_id=session.id,
-                            taste=taste,
-                            business=business,
-                        )
-
-                        session.last_prompt = asset_bundle["prompt_used"]
-
-                        tool_result = json.dumps({
-                            "status": "success",
-                            "bundle_id": asset_bundle["bundle_id"],
-                        })
-                    except Exception as gen_exc:
-                        tool_result = json.dumps({
-                            "error": f"Image generation failed: {gen_exc}. Try again.",
-                        })
-
-            tool_seq = await _next_seq(db, session.id)
-            tool_msg = {
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": tool_result,
-            }
-            messages.append(tool_msg)
-
-            db.add(Message(
-                session_id=session.id,
-                role="tool",
-                content=tool_result,
-                tool_calls={"tool_call_id": call_id},
-                sequence=tool_seq,
-            ))
-
-        await db.commit()
+    asst_seq = await _next_seq(db, session.id)
+    assistant_record = Message(
+        session_id=session.id,
+        role="assistant",
+        content=result.reply,
+        tool_calls={
+            "creative_output": result.creative_output,
+            "intent": intent.model_dump(),
+            "bundle_ids": result.bundle_ids,
+        },
+        asset_bundle_id=result.primary_bundle.get("bundle_id") if result.primary_bundle else None,
+        sequence=asst_seq,
+    )
+    db.add(assistant_record)
+    await db.commit()
 
     return {
-        "reply": assistant_text or "Tell me more.",
-        "asset_bundle": asset_bundle,
-        "tool_call": captured_call,
+        "reply": result.reply,
+        "asset_bundle": result.primary_bundle,
+        "creative_output": result.creative_output,
+        "tool_call": result.tool_call,
+        "intent": intent.model_dump(),
     }
