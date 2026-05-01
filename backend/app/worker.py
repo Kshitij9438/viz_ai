@@ -5,6 +5,8 @@ the database, executes the pipeline, and stores results back in PostgreSQL.
 
 Key resilience features:
 - Atomic job claim: UPDATE ... WHERE status='pending' prevents multi-replica races
+- Terminal states (done/failed) are never overwritten by error handlers
+- Failure handlers reload job row from DB before mutating (stale ORM safe)
 - Orphan recovery on startup: re-enqueues stuck pending/running jobs
 - Reconnect with exponential backoff on Redis disconnect
 - Per-job timeout via asyncio.wait_for
@@ -16,16 +18,19 @@ import asyncio
 import logging
 import time
 from datetime import datetime
+from typing import Any
 
 from sqlalchemy import select, update
 
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
-from app.core.queue import dequeue_job, enqueue_job, get_redis
+from app.core.queue import dequeue_job, enqueue_job
 from app.models.models import Job
 from app.services.storage import public_asset_url
 
 logger = logging.getLogger("vizzy.worker")
+
+_TERMINAL = frozenset({"done", "failed"})
 
 
 class JobWorker:
@@ -67,6 +72,9 @@ class JobWorker:
         - Container restart mid-job (status=running, never completed)
         - Redis lost the queue entry (job in DB but not in queue)
         - Worker crash (job stuck in running)
+
+        If ``result`` is already populated but status is not ``done``,
+        reconcile to ``done`` (idempotent repair — never downgrade).
         """
         try:
             async with AsyncSessionLocal() as db:
@@ -76,19 +84,39 @@ class JobWorker:
                 orphans = result.scalars().all()
 
                 for job in orphans:
-                    # Reset running jobs back to pending
+                    # Repair: success payload persisted but status not terminal
+                    if job.result is not None and job.status in ("pending", "running"):
+                        status_before = job.status
+                        job.status = "done"
+                        if job.completed_at is None:
+                            job.completed_at = datetime.utcnow()
+                        await db.commit()
+                        logger.info(
+                            "job_reconciled",
+                            extra={
+                                "event": "job_reconciled",
+                                "job_id": job.id,
+                                "status_before": status_before,
+                                "status_after": "done",
+                            },
+                        )
+                        continue
+
+                    # Reset running jobs back to pending for re-claim
                     if job.status == "running":
+                        status_before = job.status
                         job.status = "pending"
                         await db.commit()
+                    else:
+                        status_before = job.status
 
-                    # Re-enqueue to Redis
                     enqueued = await enqueue_job(job.id)
                     logger.info(
                         "job_recovered",
                         extra={
                             "event": "job_recovered",
                             "job_id": job.id,
-                            "original_status": "running" if job.status == "pending" else job.status,
+                            "original_status": status_before,
                             "re_enqueued": enqueued,
                         },
                     )
@@ -116,8 +144,6 @@ class JobWorker:
             try:
                 job_id = await dequeue_job(timeout=5)
                 if job_id is None:
-                    # No jobs in queue — sleep before polling again
-                    # (RPOP is non-blocking, so we must throttle ourselves)
                     consecutive_failures = 0
                     await asyncio.sleep(2)
                     continue
@@ -126,7 +152,6 @@ class JobWorker:
                 await self._process_job(job_id)
 
             except ConnectionError:
-                # Redis disconnected — backoff and retry
                 consecutive_failures += 1
                 delay = min(2 ** consecutive_failures, 60)
                 logger.warning(
@@ -137,8 +162,8 @@ class JobWorker:
                         "backoff_seconds": delay,
                     },
                 )
-                # Reset Redis state so get_redis() retries the connection
                 from app.core.queue import reset_redis_state
+
                 await reset_redis_state()
                 await asyncio.sleep(delay)
 
@@ -163,15 +188,84 @@ class JobWorker:
     # Job processing
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pipeline_result_is_valid(result_data: Any) -> bool:
+        """True if the pipeline produced something worth storing as success."""
+        if not result_data or not isinstance(result_data, dict):
+            return False
+        reply = result_data.get("reply")
+        if reply is not None and str(reply).strip():
+            return True
+        bundle = result_data.get("asset_bundle")
+        if isinstance(bundle, dict) and bundle.get("assets"):
+            return True
+        if result_data.get("creative_output"):
+            return True
+        return False
+
     async def _process_job(self, job_id: str) -> None:
         """Execute a single job with atomic claim and timeout."""
         started_at = time.perf_counter()
 
         async with AsyncSessionLocal() as db:
+            snapshot = (
+                await db.execute(select(Job).where(Job.id == job_id))
+            ).scalar_one_or_none()
+
+            if snapshot is None:
+                logger.warning(
+                    "job_not_found",
+                    extra={"event": "job_not_found", "job_id": job_id},
+                )
+                return
+
+            # Phase 1 / 6: terminal & idempotency — never reprocess
+            if snapshot.status == "done":
+                logger.info(
+                    "job_skipped",
+                    extra={
+                        "event": "job_skipped",
+                        "job_id": job_id,
+                        "reason": "already_done",
+                        "status_before": snapshot.status,
+                        "status_after": snapshot.status,
+                    },
+                )
+                return
+
+            if snapshot.status == "failed":
+                logger.info(
+                    "job_skipped",
+                    extra={
+                        "event": "job_skipped",
+                        "job_id": job_id,
+                        "reason": "already_failed",
+                        "status_before": snapshot.status,
+                        "status_after": snapshot.status,
+                    },
+                )
+                return
+
+            if snapshot.result is not None and snapshot.status in ("pending", "running"):
+                # Inconsistent row: treat as success (repair on the fly)
+                logger.info(
+                    "job_skipped",
+                    extra={
+                        "event": "job_skipped",
+                        "job_id": job_id,
+                        "reason": "has_result_reconcile",
+                        "status_before": snapshot.status,
+                        "status_after": "done",
+                    },
+                )
+                snapshot.status = "done"
+                if snapshot.completed_at is None:
+                    snapshot.completed_at = datetime.utcnow()
+                await db.commit()
+                return
+
             # ---- ATOMIC CLAIM ----
-            # Only ONE worker can claim a job. If another worker already
-            # changed the status, this UPDATE affects 0 rows → we skip.
-            result = await db.execute(
+            upd = await db.execute(
                 update(Job)
                 .where(Job.id == job_id, Job.status == "pending")
                 .values(
@@ -181,57 +275,168 @@ class JobWorker:
                 )
                 .returning(Job.id)
             )
-            claimed = result.scalar_one_or_none()
+            claimed_id = upd.scalar_one_or_none()
             await db.commit()
 
-            if claimed is None:
+            if claimed_id is None:
+                lost = (
+                    await db.execute(select(Job.status).where(Job.id == job_id))
+                ).scalar_one_or_none()
                 logger.info(
                     "job_claim_skipped",
-                    extra={"event": "job_claim_skipped", "job_id": job_id},
+                    extra={
+                        "event": "job_claim_skipped",
+                        "job_id": job_id,
+                        "status_before": "pending",
+                        "status_after": lost or "unknown",
+                    },
                 )
                 return
 
-            # Reload the full job record
             job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one()
 
+            logger.info(
+                "job_claimed",
+                extra={
+                    "event": "job_claimed",
+                    "job_id": job.id,
+                    "status_before": "pending",
+                    "status_after": "running",
+                    "attempt": job.attempts,
+                },
+            )
             logger.info(
                 "job_started",
                 extra={
                     "event": "job_started",
                     "job_id": job.id,
+                    "status_before": "pending",
+                    "status_after": "running",
                     "attempt": job.attempts,
                     "type": job.type,
                 },
             )
 
             try:
-                # ---- REBUILD CONTEXT & EXECUTE ----
                 result_data = await asyncio.wait_for(
                     self._execute_pipeline(db, job),
                     timeout=settings.QUEUE_JOB_TIMEOUT_SECONDS,
                 )
 
-                # ---- STORE RESULT ----
+                if not self._pipeline_result_is_valid(result_data):
+                    await self._finalize_failure(job_id, "Pipeline returned empty or invalid result")
+                    return
+
+                # Reload row — session may have seen many commits inside pipeline
+                job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one()
+                if job.status in _TERMINAL:
+                    logger.info(
+                        "job_skipped",
+                        extra={
+                            "event": "job_skipped",
+                            "job_id": job_id,
+                            "reason": "terminal_before_success_write",
+                            "status_before": job.status,
+                            "status_after": job.status,
+                        },
+                    )
+                    return
+
+                status_before_ok = job.status
                 job.status = "done"
                 job.result = result_data
                 job.completed_at = datetime.utcnow()
+                job.error = None
                 await db.commit()
 
-                duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-                logger.info(
-                    "job_completed",
-                    extra={
-                        "event": "job_completed",
-                        "job_id": job.id,
-                        "duration_ms": duration_ms,
-                    },
-                )
+                # Phase 5: nothing after success commit may affect DB state
+                try:
+                    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                    logger.info(
+                        "job_succeeded",
+                        extra={
+                            "event": "job_succeeded",
+                            "job_id": job_id,
+                            "status_before": status_before_ok,
+                            "status_after": "done",
+                            "duration_ms": duration_ms,
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "job_succeeded_log_failed",
+                        extra={"event": "job_succeeded_log_failed", "job_id": job_id},
+                    )
 
             except asyncio.TimeoutError:
-                await self._handle_failure(db, job, "Job timed out")
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                await self._finalize_failure(job_id, "Job timed out")
 
             except Exception as exc:
-                await self._handle_failure(db, job, str(exc))
+                try:
+                    await db.rollback()
+                except Exception:
+                    pass
+                await self._finalize_failure(job_id, str(exc))
+
+    async def _finalize_failure(self, job_id: str, error_msg: str) -> None:
+        """Handle failure using a fresh DB session; never overwrite ``done`` or valid ``result``."""
+        async with AsyncSessionLocal() as db:
+            job = (
+                await db.execute(select(Job).where(Job.id == job_id))
+            ).scalar_one_or_none()
+            if job is None:
+                return
+
+            status_before = job.status
+
+            if job.status == "done":
+                logger.info(
+                    "job_skipped",
+                    extra={
+                        "event": "job_skipped",
+                        "job_id": job_id,
+                        "reason": "failure_after_done",
+                        "status_before": status_before,
+                        "status_after": "done",
+                    },
+                )
+                return
+
+            if job.result is not None:
+                job.status = "done"
+                job.error = None
+                if job.completed_at is None:
+                    job.completed_at = datetime.utcnow()
+                await db.commit()
+                logger.warning(
+                    "job_recovered_result_on_failure_path",
+                    extra={
+                        "event": "job_recovered_result_on_failure_path",
+                        "job_id": job_id,
+                        "status_before": status_before,
+                        "status_after": "done",
+                    },
+                )
+                return
+
+            if job.status not in ("running", "pending"):
+                logger.info(
+                    "job_skipped",
+                    extra={
+                        "event": "job_skipped",
+                        "job_id": job_id,
+                        "reason": "unexpected_status_on_failure",
+                        "status_before": status_before,
+                        "status_after": job.status,
+                    },
+                )
+                return
+
+            await self._handle_failure(db, job, error_msg)
 
     async def _execute_pipeline(self, db, job: Job) -> dict:
         """Rebuild full PipelineContext from DB and execute the pipeline."""
@@ -241,16 +446,14 @@ class JobWorker:
         from app.services.pipeline_engine import PipelineContext, execute_pipeline
         from sqlalchemy import func, select as sa_select
 
-        # Load fresh context from DB
-        session = (await db.execute(
-            select(SessionModel).where(SessionModel.id == job.session_id)
-        )).scalar_one()
+        session = (
+            await db.execute(select(SessionModel).where(SessionModel.id == job.session_id))
+        ).scalar_one()
 
         taste = await get_or_create_taste(db, job.user_id)
         business = await get_business(db, job.user_id)
         recent_msgs = await get_recent_messages(db, job.session_id)
 
-        # Store the user message in conversation history
         max_seq_result = await db.execute(
             sa_select(func.max(Message.sequence)).where(Message.session_id == job.session_id)
         )
@@ -267,7 +470,6 @@ class JobWorker:
         session.message_count += 1
         await db.commit()
 
-        # Reconstruct intent from stored data
         intent_data = job.intent_data or {}
         pipeline_name = intent_data.get("pipeline", "image_pipeline")
         if pipeline_name not in PIPELINE_STEPS:
@@ -282,7 +484,6 @@ class JobWorker:
             parameters=intent_data.get("parameters", {}),
         )
 
-        # Build context and execute
         ctx = PipelineContext(
             db=db,
             user_id=job.user_id,
@@ -297,14 +498,12 @@ class JobWorker:
 
         pipeline_result = await execute_pipeline(ctx, intent)
 
-        # Update session state
         if pipeline_result.primary_bundle:
             session.last_prompt = (
                 pipeline_result.primary_bundle.get("prompt_used")
                 or pipeline_result.memory_signal
             )
 
-        # Store assistant message
         asst_seq = current_max + 2
         asst_msg = Message(
             session_id=job.session_id,
@@ -325,7 +524,6 @@ class JobWorker:
         db.add(asst_msg)
         await db.commit()
 
-        # Normalize asset URLs for the result
         bundle = pipeline_result.primary_bundle
         if bundle:
             bundle = dict(bundle)
@@ -344,7 +542,42 @@ class JobWorker:
         }
 
     async def _handle_failure(self, db, job: Job, error_msg: str) -> None:
-        """Handle job failure: retry or mark as permanently failed."""
+        """Retry or mark failed. Caller must ensure job is not terminal."""
+        await db.refresh(job)
+
+        status_before = job.status
+
+        if job.status == "done":
+            logger.info(
+                "job_skipped",
+                extra={
+                    "event": "job_skipped",
+                    "job_id": job.id,
+                    "reason": "handle_failure_done_guard",
+                    "status_before": status_before,
+                    "status_after": "done",
+                },
+            )
+            return
+
+        if job.result is not None:
+            job.status = "done"
+            job.error = None
+            if job.completed_at is None:
+                job.completed_at = datetime.utcnow()
+            await db.commit()
+            logger.warning(
+                "job_recovered_result_in_handle_failure",
+                extra={
+                    "event": "job_recovered_result_in_handle_failure",
+                    "job_id": job.id,
+                    "status_before": status_before,
+                    "status_after": "done",
+                },
+            )
+            return
+
+        # Phase 7: retry only when attempts remain (claim increments attempts each try)
         will_retry = job.attempts < settings.QUEUE_MAX_TRIES
 
         if will_retry:
@@ -352,32 +585,36 @@ class JobWorker:
             job.error = error_msg
             await db.commit()
 
-            # Re-enqueue for retry
             await enqueue_job(job.id)
 
             logger.warning(
-                "job_failed",
+                "job_retry_scheduled",
                 extra={
-                    "event": "job_failed",
+                    "event": "job_retry_scheduled",
                     "job_id": job.id,
                     "error": error_msg[:300],
                     "attempt": job.attempts,
+                    "status_before": status_before,
+                    "status_after": "pending",
                     "will_retry": True,
                 },
             )
-        else:
-            job.status = "failed"
-            job.error = error_msg
-            job.completed_at = datetime.utcnow()
-            await db.commit()
+            return
 
-            logger.error(
-                "job_failed",
-                extra={
-                    "event": "job_failed",
-                    "job_id": job.id,
-                    "error": error_msg[:300],
-                    "attempt": job.attempts,
-                    "will_retry": False,
-                },
-            )
+        job.status = "failed"
+        job.error = error_msg
+        job.completed_at = datetime.utcnow()
+        await db.commit()
+
+        logger.error(
+            "job_failed",
+            extra={
+                "event": "job_failed",
+                "job_id": job.id,
+                "error": error_msg[:300],
+                "attempt": job.attempts,
+                "status_before": status_before,
+                "status_after": "failed",
+                "will_retry": False,
+            },
+        )
