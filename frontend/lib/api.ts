@@ -62,13 +62,35 @@ export type ChatMessage = {
 
 export type ChatResponse = {
   reply: string;
-  asset_bundle: AssetBundle | null;
+  asset_bundle?: AssetBundle | null;
   creative_output?: CreativeOutput | null;
   intent?: Record<string, any> | null;
-  tool_call: unknown | null;
+  tool_call?: unknown | null;
   session_id: string;
   user_id: string;
   guest_token?: string | null;
+  job_id?: string | null;
+  job_status?: string | null;
+};
+
+/** Shape of `result` on GET /api/v1/jobs/{id} when status is `done` (matches worker payload). */
+export type JobResultPayload = {
+  reply?: string;
+  asset_bundle?: AssetBundle | null;
+  creative_output?: CreativeOutput | null;
+  intent?: Record<string, any> | null;
+  tool_call?: unknown | null;
+};
+
+export type JobStatusResponse = {
+  job_id: string;
+  status: string;
+  result?: JobResultPayload | null;
+  error?: string | null;
+  retry_after?: number | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
 };
 
 export type SessionSummary = {
@@ -319,6 +341,25 @@ export async function sendChat(body: {
     asset_bundle: normalizeBundle(data.asset_bundle),
     creative_output: normalizeCreativeOutput(data.creative_output),
   };
+}
+
+export async function getJobStatus(jobId: string): Promise<JobStatusResponse> {
+  return parseResponse<JobStatusResponse>(
+    await apiFetch(`${API}/api/v1/jobs/${encodeURIComponent(jobId)}`, {
+      headers: authHeaders(),
+    }),
+  );
+}
+
+/** Normalize `asset_bundle` from a completed job's `result` (not top-level `response.asset_bundle`). */
+export function bundleFromJobResult(result: JobResultPayload | null | undefined): AssetBundle | null {
+  if (!result) return null;
+  return normalizeBundle(result.asset_bundle);
+}
+
+export function creativeOutputFromJobResult(result: JobResultPayload | null | undefined): CreativeOutput | null {
+  if (!result) return null;
+  return normalizeCreativeOutput(result.creative_output);
 }
 
 export async function uploadFile(file: File): Promise<Attachment> {

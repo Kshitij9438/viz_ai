@@ -12,9 +12,12 @@ import {
   Attachment,
   ChatMessage,
   SessionSummary,
+  bundleFromJobResult,
   clearAuthState,
   createGuest,
+  creativeOutputFromJobResult,
   endSession,
+  getJobStatus,
   getSessionMessages,
   listSessions,
   login,
@@ -56,6 +59,7 @@ export default function Page() {
   const inputRef = useRef<HTMLInputElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const activeLoadRef = useRef(0);
+  const activePollRef = useRef(0);
   const restoredSessionRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
 
@@ -72,6 +76,7 @@ export default function Page() {
   }, []);
 
   const loadSession = useCallback(async (nextSessionId: string) => {
+    activePollRef.current += 1;
     const loadId = activeLoadRef.current + 1;
     activeLoadRef.current = loadId;
     restoredSessionRef.current = true;
@@ -162,6 +167,7 @@ export default function Page() {
   }
 
   function logout() {
+    activePollRef.current += 1;
     clearAuthState();
     setToken(null);
     setGuestToken(null);
@@ -175,6 +181,7 @@ export default function Page() {
   }
 
   async function newChat() {
+    activePollRef.current += 1;
     const currentSessionId = sessionIdRef.current;
     activeLoadRef.current += 1;
     setSessionId(null);
@@ -197,12 +204,15 @@ export default function Page() {
     const text = input.trim();
     if (!text || busy || loadingHistory) return;
 
+    const pollId = ++activePollRef.current;
     const currentSessionId = sessionId;
     const attachments = pendingAttachments;
     setInput("");
     setPendingAttachments([]);
     setBusy(true);
     setMessages((current) => [...current, { role: "user", content: text, attachments }]);
+
+    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
     try {
       const res = await sendChat({
@@ -211,18 +221,84 @@ export default function Page() {
         attachments,
       });
 
+      if (pollId !== activePollRef.current) return;
+
       if (!currentSessionId || currentSessionId === sessionIdRef.current) {
         setUserId(res.user_id);
         setSessionId(res.session_id);
-        setMessages((current) => [
-          ...current,
-          {
-            role: "assistant",
-            content: res.reply,
-            bundle: res.asset_bundle,
-            creative_output: res.creative_output,
-          },
-        ]);
+
+        if (res.job_id) {
+          let assistantMessageIndex = 0;
+          setMessages((current) => {
+            const next = [
+              ...current,
+              {
+                role: "assistant" as const,
+                content: res.reply,
+                bundle: null as AssetBundle | null | undefined,
+                creative_output: null as ChatMessage["creative_output"],
+              },
+            ];
+            assistantMessageIndex = next.length - 1;
+            return next;
+          });
+
+          while (pollId === activePollRef.current) {
+            const job = await getJobStatus(res.job_id);
+            console.log("job response", job);
+            console.log("assets", job.result?.asset_bundle?.assets);
+
+            if (pollId !== activePollRef.current) break;
+
+            if (job.status === "done") {
+              const result = job.result;
+              const bundle = bundleFromJobResult(result);
+              const creative = creativeOutputFromJobResult(result);
+              const replyText = result?.reply ?? res.reply;
+
+              setMessages((current) => {
+                const copy = [...current];
+                const existing = copy[assistantMessageIndex];
+                if (existing?.role !== "assistant") return current;
+                copy[assistantMessageIndex] = {
+                  ...existing,
+                  content: replyText,
+                  bundle,
+                  creative_output: creative,
+                };
+                return copy;
+              });
+              break;
+            }
+
+            if (job.status === "failed") {
+              setMessages((current) => {
+                const copy = [...current];
+                const existing = copy[assistantMessageIndex];
+                if (existing?.role !== "assistant") return current;
+                copy[assistantMessageIndex] = {
+                  ...existing,
+                  content: `${existing.content}\n\n${job.error || "Generation failed."}`,
+                };
+                return copy;
+              });
+              break;
+            }
+
+            const waitMs = Math.max(500, (job.retry_after ?? 2) * 1000);
+            await sleep(waitMs);
+          }
+        } else {
+          setMessages((current) => [
+            ...current,
+            {
+              role: "assistant",
+              content: res.reply,
+              bundle: res.asset_bundle ?? null,
+              creative_output: res.creative_output ?? null,
+            },
+          ]);
+        }
       }
 
       await refreshSessions();
