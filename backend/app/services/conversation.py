@@ -198,7 +198,19 @@ async def converse(
     taste = await get_or_create_taste(db, session.user_id)
     business = await get_business(db, session.user_id)
     summaries = await get_recent_session_summaries(db, session.user_id)
-    history = await get_recent_messages(db, session.id)
+
+    # 🔥 STRONG RECENT MEMORY (guaranteed continuity)
+    result = await db.execute(
+        select(Message)
+        .where(Message.session_id == session.id)
+        .order_by(Message.sequence.desc())
+        .limit(12)  # ⚖️ balanced window
+    )
+    recent_msgs = list(reversed(result.scalars().all()))
+
+    # Fallback (in case DB is empty / edge case)
+    if not recent_msgs:
+        recent_msgs = await get_recent_messages(db, session.id)
 
     system_prompt = _assemble_system_prompt(
         taste=taste,
@@ -207,13 +219,23 @@ async def converse(
         session_summaries=summaries,
     )
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-    messages.extend(_msgs_to_model(history))
+    # 🔥 subtle but important: enforce conversational continuity
+    system_prompt += (
+        "\n\nYou are in an ongoing conversation. "
+        "Always refer to previous messages when relevant."
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt}
+    ]
+
+    messages.extend(_msgs_to_model(recent_msgs))
 
     # -------- USER MESSAGE -------- #
     user_content = user_message
     messages.append({"role": "user", "content": user_content})
 
+    # -------- STORE USER -------- #
     user_seq = await _next_seq(db, session.id)
     db.add(Message(
         session_id=session.id,
@@ -241,16 +263,13 @@ async def converse(
         assistant_text = (msg.get("content") or "").strip()
         raw_tool_calls: list[dict] = msg.get("tool_calls") or []
 
-        # -------- NORMALIZE TOOL CALLS -------- #
-        # Do this once here so both the in-memory entry AND the DB entry
-        # use exactly the same normalized form (same ids, type, argument format).
         tool_calls = [_normalize_tool_call(c) for c in raw_tool_calls]
 
-        # -------- BUILD & PERSIST ASSISTANT ENTRY -------- #
         assistant_entry: dict[str, Any] = {
             "role": "assistant",
             "content": assistant_text,
         }
+
         if tool_calls:
             assistant_entry["tool_calls"] = tool_calls
 
@@ -265,24 +284,17 @@ async def converse(
             sequence=asst_seq,
         ))
 
-        # -------- CRITICAL: commit assistant BEFORE tool execution -------- #
-        # If tool execution raises, we still have the assistant message in the
-        # DB. Without this commit, a retry would persist the assistant message
-        # again, creating a ghost entry with no paired tool message.
         await db.commit()
 
-        # -------- NO TOOL → DONE -------- #
         if not tool_calls:
             break
 
         # -------- TOOL EXECUTION -------- #
         for call in tool_calls:
-            # call is already normalized: id is guaranteed non-null, type is present
             call_id: str = call["id"]
             fn = call.get("function", {})
 
             if fn.get("name") != "generate":
-                # Unknown tool — respond with an error so the LLM can recover
                 tool_result = json.dumps({"error": f"Unknown tool: {fn.get('name')}"})
             else:
                 args = fn.get("arguments", {})
@@ -315,16 +327,15 @@ async def converse(
                             "status": "success",
                             "bundle_id": asset_bundle["bundle_id"],
                         })
-                    except Exception as gen_exc:  # noqa: BLE001
+                    except Exception as gen_exc:
                         tool_result = json.dumps({
-                            "error": f"Image generation failed: {gen_exc}. Please try again in a moment.",
+                            "error": f"Image generation failed: {gen_exc}. Try again.",
                         })
 
-            # Tool message — tool_call_id MUST match the assistant's call id
             tool_seq = await _next_seq(db, session.id)
-            tool_msg: dict[str, Any] = {
+            tool_msg = {
                 "role": "tool",
-                "tool_call_id": call_id,   # guaranteed non-null (normalized above)
+                "tool_call_id": call_id,
                 "content": tool_result,
             }
             messages.append(tool_msg)
@@ -339,7 +350,6 @@ async def converse(
 
         await db.commit()
 
-    # -------- FINAL RESPONSE -------- #
     return {
         "reply": assistant_text or "Tell me more.",
         "asset_bundle": asset_bundle,
