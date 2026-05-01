@@ -5,7 +5,6 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.db import init_db
@@ -14,9 +13,12 @@ from app.routers import assets, auth, chat, profiles, uploads
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Keep local dir for fallback mode only
     Path(settings.STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+
     if not settings.JWT_SECRET_KEY or len(settings.JWT_SECRET_KEY) < 32:
         raise RuntimeError("JWT_SECRET_KEY must be set and at least 32 characters long.")
+
     await init_db()
     yield
 
@@ -34,7 +36,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/storage", StaticFiles(directory=settings.STORAGE_DIR), name="storage")
+# ❌ REMOVED StaticFiles mount (now using Supabase)
 
 app.include_router(auth.router)
 app.include_router(chat.router)
@@ -45,4 +47,9 @@ app.include_router(assets.router)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "image_backend": settings.IMAGE_BACKEND, "llm_model": settings.GITHUB_MODEL}
+    return {
+        "ok": True,
+        "image_backend": settings.IMAGE_BACKEND,
+        "llm_model": settings.GITHUB_MODEL,
+        "storage": "supabase" if settings.SUPABASE_URL else "local",
+    }

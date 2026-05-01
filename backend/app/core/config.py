@@ -9,28 +9,53 @@ load_dotenv()
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    # LLM provider (GitHub Models / Azure OpenAI-compatible)
+    # ---------------------------
+    # 🔐 LLM
+    # ---------------------------
     GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
     GITHUB_MODEL: str = "gpt-4.1-mini"
     GITHUB_VISION_MODEL: str = "gpt-4.1-mini"
 
-    # Database
+    # ---------------------------
+    # 🗄️ DATABASE
+    # ---------------------------
     DATABASE_URL: str = os.getenv("DATABASE_URL", "")
-    
 
-    # Image generation backend
+    # ---------------------------
+    # 🧠 IMAGE BACKEND
+    # ---------------------------
     IMAGE_BACKEND: str = "pollinations"
     HF_TOKEN: str | None = None
 
-    # Storage & public URL
-    STORAGE_DIR: str = "./storage"
+    # ---------------------------
+    # ☁️ SUPABASE STORAGE (NEW)
+    # ---------------------------
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+    SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+
+    # ---------------------------
+    # 🌍 PUBLIC URL (for assets)
+    # ---------------------------
     PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
 
-    # CORS (comma-separated for multiple origins)
+    # ---------------------------
+    # 📁 LOCAL STORAGE (DEPRECATED)
+    # ---------------------------
+    STORAGE_DIR: str = "./storage"
+
+    # ---------------------------
+    # 🌐 CORS
+    # ---------------------------
     FRONTEND_ORIGIN: str = os.getenv("FRONTEND_ORIGIN", "")
 
-    # Railway injects PORT automatically
+    # ---------------------------
+    # 🚀 SERVER
+    # ---------------------------
     PORT: int = int(os.environ.get("PORT", "8000"))
+
+    # ---------------------------
+    # 🔐 AUTH
+    # ---------------------------
     JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "")
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = int(os.environ.get("JWT_EXPIRE_MINUTES", "10080"))  # 7 days
