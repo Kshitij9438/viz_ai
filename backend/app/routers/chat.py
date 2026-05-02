@@ -25,7 +25,6 @@ from app.services.design_context import (
     is_ready,
     merge_design_context,
     readiness_state,
-    soft_escalate_to_confirmation,
 )
 from app.services.generation_intent_gate import classify_generation_mode
 from app.services.intent_engine import classify_intent
@@ -189,14 +188,12 @@ async def chat(
         from app.services.intent_engine import _fallback_intent
         intent = _fallback_intent(req.message, [a.model_dump() for a in req.attachments] if req.attachments else None)
 
-    # ---- Step 1b: Gate image/edit — guided flow; enqueue only on generate or confirm+ready ----
+    # ---- Step 1b: Gate image/edit — gate_mode is sole routing authority (not LLM intent) ----
     if intent.intent in ("image", "edit"):
         gate_mode = classify_generation_mode(
             req.message, has_attachments=bool(req.attachments)
         )
         ready = is_ready(design_ctx)
-        soft_ready = soft_escalate_to_confirmation(design_ctx)
-        confirm_turn = ready or soft_ready
         _chat_log.info(
             "intent_classified",
             extra={
@@ -206,7 +203,6 @@ async def chat(
                 "user_message": req.message[:500],
                 "pipeline_intent": intent.intent,
                 "design_ready": ready,
-                "soft_escalate": soft_ready,
             },
         )
 
@@ -249,29 +245,22 @@ async def chat(
                 {"force_chat_pipeline": True, "refinement_mode": False},
             )
 
-        if gate_mode == "refine" and confirm_turn:
-            return await _gated_converse_response(
-                {
-                    "force_chat_pipeline": True,
-                    "refinement_mode": False,
-                    "awaiting_confirmation": True,
-                },
-            )
-
-        if gate_mode == "refine" and not confirm_turn:
+        if gate_mode == "refine":
             return await _gated_converse_response(
                 {"force_chat_pipeline": True, "refinement_mode": True},
             )
 
         if gate_mode == "confirm" and not ready:
             return await _gated_converse_response(
-                {"force_chat_pipeline": True, "refinement_mode": True},
+                {"force_chat_pipeline": True, "refinement_mode": False},
             )
 
+        # Enqueue only: generate OR confirm with a ready design brief
         if not (gate_mode == "generate" or (gate_mode == "confirm" and ready)):
             return await _gated_converse_response(
-                {"force_chat_pipeline": True, "refinement_mode": True},
+                {"force_chat_pipeline": True, "refinement_mode": False},
             )
+        # else: fall through to Step 3
 
     # ---- Step 2: Chat-only (no generation) → sync fast path ----
     if intent.intent not in _GENERATION_INTENTS:

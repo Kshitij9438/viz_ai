@@ -1,4 +1,9 @@
-"""Layer 5 — Generation Pipelines + Layer 3 routing + Layer 6 AssetBundle assembly."""
+"""Layer 5 — Generation Pipelines + Layer 3 routing + Layer 6 AssetBundle assembly.
+
+Chat-only turns bypass this module: ``app.services.pipeline_engine.execute_pipeline``
+honors ``PipelineContext.force_chat_pipeline`` and runs ``ChatPipeline`` without
+calling ``run_generation``.
+"""
 from __future__ import annotations
 
 import asyncio

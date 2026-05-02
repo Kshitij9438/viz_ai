@@ -190,20 +190,12 @@ class JobWorker:
 
     @staticmethod
     def _pipeline_result_is_valid(result_data: Any) -> bool:
-        """True if the pipeline produced something worth storing as success."""
+        """True if the worker should mark the job done (never fail after real generation)."""
         if not result_data or not isinstance(result_data, dict):
             return False
-        reply = result_data.get("reply")
-        if reply is not None and str(reply).strip():
+        if result_data.get("reply"):
             return True
-        bundle = result_data.get("asset_bundle")
-        if isinstance(bundle, dict):
-            # Bundle persisted (e.g. image_success) even if URL rewrite drops all assets
-            if bundle.get("bundle_id"):
-                return True
-            if bundle.get("assets"):
-                return True
-        if result_data.get("creative_output"):
+        if result_data.get("asset_bundle"):
             return True
         return False
 
@@ -421,34 +413,40 @@ class JobWorker:
 
             status_before = job.status
 
-            if job.status == "done":
-                logger.info(
-                    "job_skipped",
-                    extra={
-                        "event": "job_skipped",
-                        "job_id": job_id,
-                        "reason": "failure_after_done",
-                        "status_before": status_before,
-                        "status_after": "done",
-                    },
-                )
-                return
-
-            if job.result is not None:
-                job.status = "done"
-                job.error = None
-                if job.completed_at is None:
-                    job.completed_at = datetime.utcnow()
-                await db.commit()
-                logger.warning(
-                    "job_recovered_result_on_failure_path",
-                    extra={
-                        "event": "job_recovered_result_on_failure_path",
-                        "job_id": job_id,
-                        "status_before": status_before,
-                        "status_after": "done",
-                    },
-                )
+            # Never retry / mark failed once success is persisted (or already terminal).
+            if job.status == "done" or job.result is not None:
+                if job.result is not None and job.status != "done":
+                    job.status = "done"
+                    job.error = None
+                    if job.completed_at is None:
+                        job.completed_at = datetime.utcnow()
+                    await db.commit()
+                    try:
+                        logger.warning(
+                            "job_recovered_result_on_failure_path",
+                            extra={
+                                "event": "job_recovered_result_on_failure_path",
+                                "job_id": job_id,
+                                "status_before": status_before,
+                                "status_after": "done",
+                            },
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        logger.info(
+                            "job_skipped",
+                            extra={
+                                "event": "job_skipped",
+                                "job_id": job_id,
+                                "reason": "failure_after_done_or_has_result",
+                                "status_before": status_before,
+                                "status_after": job.status,
+                            },
+                        )
+                    except Exception:
+                        pass
                 return
 
             if job.status not in ("running", "pending"):

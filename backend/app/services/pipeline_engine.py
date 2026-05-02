@@ -28,6 +28,8 @@ class PipelineContext:
     refinement_mode: bool = False
     awaiting_confirmation: bool = False
     design_context: dict[str, Any] | None = None
+    #: When True, ``execute_pipeline`` always runs ``ChatPipeline`` (no generation routers).
+    force_chat_pipeline: bool = False
 
 
 @dataclass
@@ -296,11 +298,56 @@ class VideoPipeline(BasePipeline):
         return _visual_result("video", "I made a video-loop key visual placeholder.", bundle, intent)
 
 
+_CHAT_GATE_SYSTEM = (
+    "You are a conversational assistant helping refine a user's idea.\n"
+    "- Ask ONE focused question.\n"
+    "- Do NOT generate images.\n"
+    "- Do NOT assume completion.\n"
+    "- Keep responses short and natural.\n"
+    "- Never use phrases like: \"Here is your design\", \"I created this\", "
+    "\"Generated image\", or claim you produced visuals.\n\n"
+)
+
+
 class ChatPipeline(BasePipeline):
     name = "chat_pipeline"
 
     async def run(self, ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
         from app.services.design_context import format_confirmation, is_ready, readiness_state
+
+        if ctx.force_chat_pipeline:
+            if ctx.awaiting_confirmation:
+                dc = ctx.design_context or {}
+                if is_ready(dc):
+                    body = format_confirmation(dc)
+                else:
+                    body = await ollama.complete(
+                        _CHAT_GATE_SYSTEM
+                        + "The brief is not complete. Ask ONE short question about subject, "
+                        "style, colors, or mood.\n\n"
+                        f"User: {ctx.message}"
+                    )
+            elif ctx.refinement_mode:
+                hint = ""
+                if ctx.design_context and any(
+                    ctx.design_context.get(k) for k in ("subject", "style", "colors", "mood")
+                ):
+                    hint = f"\nDesign cues so far: {ctx.design_context}\n"
+                body = await ollama.complete(
+                    _CHAT_GATE_SYSTEM
+                    + "The user is refining direction only. Ask ONE clarifying question. "
+                    "Do not imply you are generating or showing images.\n"
+                    f"{hint}\nUser: {ctx.message}"
+                )
+            else:
+                body = await ollama.complete(
+                    _CHAT_GATE_SYSTEM + f"User: {ctx.message}"
+                )
+            return PipelineResult(
+                reply=body or "What would you like to focus on next?",
+                creative_output={"type": "chat", "outputs": [], "metadata": {"intent": intent.model_dump()}},
+                tool_call={"name": "pipeline", "arguments": intent.model_dump()},
+            )
 
         if ctx.awaiting_confirmation:
             dc = ctx.design_context or {}
@@ -372,6 +419,9 @@ PIPELINE_REGISTRY: dict[str, BasePipeline] = {
 
 
 async def execute_pipeline(ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
+    if ctx.force_chat_pipeline:
+        chat = PIPELINE_REGISTRY["chat_pipeline"]
+        return await chat.run(ctx, intent)
     pipeline = PIPELINE_REGISTRY.get(intent.pipeline) or PIPELINE_REGISTRY["image_pipeline"]
     return await pipeline.run(ctx, intent)
 

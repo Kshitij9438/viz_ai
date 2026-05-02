@@ -288,6 +288,7 @@ async def converse(
             refinement_mode=refinement_mode,
             awaiting_confirmation=awaiting_confirmation,
             design_context=dc if isinstance(dc, dict) else None,
+            force_chat_pipeline=force_chat_pipeline,
         ),
         intent,
     )
