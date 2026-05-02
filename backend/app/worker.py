@@ -83,6 +83,13 @@ class JobWorker:
         self._shutdown.clear()
         await self._recover_orphaned_jobs()
         self._task = asyncio.create_task(self._loop(), name="vizzy-worker")
+        logger.info(
+            "worker_version_check",
+            extra={
+                "event": "worker_version_check",
+                "version": "final_retry_safe_v1",
+            },
+        )
         logger.info("worker_started", extra={"event": "worker_started"})
 
     async def stop(self) -> None:
@@ -327,6 +334,10 @@ class JobWorker:
             job.completed_at = datetime.utcnow()
             job.error = None
             await db.commit()
+            logger.info(
+                "job_success_marker_v1",
+                extra={"job_id": job_id},
+            )
 
         try:
             logger.info(
@@ -814,6 +825,10 @@ class JobWorker:
                 return
 
             await enqueue_job(job.id)
+            logger.info(
+                "retry_marker_v1",
+                extra={"job_id": job.id},
+            )
 
             logger.warning(
                 "job_retry_scheduled",
