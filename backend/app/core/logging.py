@@ -19,6 +19,7 @@ class JsonFormatter(logging.Formatter):
         # Job lifecycle
         "job_id", "attempt", "will_retry", "type",
         "original_status", "re_enqueued",
+        "status", "status_before", "status_after", "has_result",
         # Queue & backpressure
         "queue_depth", "max_depth", "operation",
         # Rate control
@@ -29,6 +30,13 @@ class JsonFormatter(logging.Formatter):
         "worker_replica",
         # Dedup
         "user_id", "count",
+        # Chat / design context (never use LogRecord-reserved keys in extra)
+        "session_id", "intent", "user_message", "pipeline_intent",
+        "design_ready", "soft_escalate",
+        "subject", "style", "colors", "mood",
+        "ready", "has_subject", "has_style", "has_colors", "has_mood", "has_visual_cue",
+        # Prompt audit
+        "prompt", "prompt_length", "prompt_len",
     )
 
     def format(self, record: logging.LogRecord) -> str:

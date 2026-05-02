@@ -201,8 +201,9 @@ async def chat(
             "intent_classified",
             extra={
                 "event": "intent_classified",
+                "session_id": session.id,
                 "intent": gate_mode,
-                "message": req.message[:500],
+                "user_message": req.message[:500],
                 "pipeline_intent": intent.intent,
                 "design_ready": ready,
                 "soft_escalate": soft_ready,
