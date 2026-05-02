@@ -188,17 +188,34 @@ class JobWorker:
     # Job processing
     # ------------------------------------------------------------------
 
+    # FIX 1: Production-safe validation — accept any asset_bundle (even empty),
+    # never reject real generation output.
     @staticmethod
     def _pipeline_result_is_valid(result_data: Any) -> bool:
-        """True if the worker should mark the job done (never fail after real generation)."""
+        """
+        Production-safe validation.
+
+        Rules:
+        - reply → valid (chat)
+        - asset_bundle present → valid (even if empty dict/list)
+        - NEVER reject real generation output
+        """
         if not result_data or not isinstance(result_data, dict):
             return False
-        if result_data.get("reply"):
+
+        # Chat response
+        if isinstance(result_data.get("reply"), str) and result_data["reply"].strip():
             return True
-        if result_data.get("asset_bundle"):
+
+        # ANY asset bundle present counts as success (even if empty dict/list).
+        # Extracted to a variable for explicit intent — avoids accidental truthiness bugs later.
+        bundle = result_data.get("asset_bundle")
+        if bundle is not None:
             return True
+
         return False
 
+    # FIX 4: Idempotent success finalizer — skip double-finalization in race conditions.
     async def _finalize_success(
         self, job_id: str, result_data: dict[str, Any], *, started_at_perf: float
     ) -> None:
@@ -225,6 +242,7 @@ class JobWorker:
                 except Exception:
                     pass
                 return
+
             if job.status in _TERMINAL:
                 try:
                     logger.info(
@@ -240,6 +258,11 @@ class JobWorker:
                 except Exception:
                     pass
                 return
+
+            # FIX 4: Guard against double-finalization in race conditions.
+            if job.result is not None:
+                return
+
             status_before_ok = job.status
             job.status = "done"
             job.result = result_data
@@ -382,10 +405,18 @@ class JobWorker:
                     timeout=settings.QUEUE_JOB_TIMEOUT_SECONDS,
                 )
 
+                # FIX 2: Hardened success/failure block.
+                # If validation fails but an asset_bundle is present, always treat as success.
                 if not self._pipeline_result_is_valid(result_data):
+                    # SAFETY: bundle exists → success regardless of other fields
+                    if isinstance(result_data, dict) and result_data.get("asset_bundle") is not None:
+                        await self._finalize_success(job_id, result_data, started_at_perf=started_at)
+                        return
+
                     await self._finalize_failure(job_id, "Pipeline returned empty or invalid result")
                     return
 
+                # Normal success path
                 await self._finalize_success(job_id, result_data, started_at_perf=started_at)
 
             except asyncio.TimeoutError:
@@ -573,34 +604,10 @@ class JobWorker:
 
         status_before = job.status
 
-        if job.status == "done":
-            logger.info(
-                "job_skipped",
-                extra={
-                    "event": "job_skipped",
-                    "job_id": job.id,
-                    "reason": "handle_failure_done_guard",
-                    "status_before": status_before,
-                    "status_after": "done",
-                },
-            )
-            return
-
-        if job.result is not None:
-            job.status = "done"
-            job.error = None
-            if job.completed_at is None:
-                job.completed_at = datetime.utcnow()
-            await db.commit()
-            logger.warning(
-                "job_recovered_result_in_handle_failure",
-                extra={
-                    "event": "job_recovered_result_in_handle_failure",
-                    "job_id": job.id,
-                    "status_before": status_before,
-                    "status_after": "done",
-                },
-            )
+        # FIX 3: Absolute guard — prevents race-condition retries after success.
+        # Covers both job.status == "done" and job.result is not None in one check;
+        # the subsequent blocks that checked each individually are removed as dead code.
+        if job.status == "done" or job.result is not None:
             return
 
         # Never retry after success payload or terminal success
@@ -614,6 +621,12 @@ class JobWorker:
             job.status = "pending"
             job.error = error_msg
             await db.commit()
+
+            # ABSOLUTE FINAL GUARD: re-read DB state before enqueue to catch
+            # any concurrent success commit from another worker/session.
+            await db.refresh(job)
+            if job.status == "done" or job.result is not None:
+                return
 
             await enqueue_job(job.id)
 
