@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -17,6 +19,16 @@ from app.services.prompt_builder import build_image_prompt, build_negative_promp
 from app.services.storage import storage
 
 
+def _generation_base_seed(user_id: str, prompt: str) -> int:
+    """Per-request seed for diversity + reproducibility if inputs replay (includes time)."""
+    payload = f"{user_id}\0{prompt}\0{time.time_ns()}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 2) + 1
+
+
+def _seed_variant(base: int, salt: int) -> int:
+    return ((base + salt * 100_003) % (2**31 - 2)) + 1
+
+
 # ---------- low-level generation ----------
 
 async def _gen_one(
@@ -27,6 +39,7 @@ async def _gen_one(
     height: int,
     reference_image_url: str | None = None,
     reference_strength: float | None = None,
+    seed: int | None = None,
 ) -> bytes:
     """Generate a single image via the rate-limited backend."""
     return await image_backend.generate_safe(
@@ -36,17 +49,22 @@ async def _gen_one(
         height=height,
         reference_image_url=reference_image_url,
         reference_strength=reference_strength,
+        seed=seed,
     )
 
 
-async def _gen_many(prompt: str, n: int, **kw) -> list[bytes]:
+async def _gen_many(prompt: str, n: int, *, seed: int | None = None, **kw: Any) -> list[bytes]:
     """Generate n images with bounded concurrency (Semaphore(2)).
 
     Each call goes through the image semaphore in generate_safe(),
     so at most 2 image API requests are in-flight at once.
     This prevents Pollinations 429 spam while still allowing parallelism.
     """
-    return await asyncio.gather(*[_gen_one(prompt, **kw) for _ in range(n)])
+    async def one(i: int) -> bytes:
+        s = None if seed is None else _seed_variant(seed, i)
+        return await _gen_one(prompt, seed=s, **kw)
+
+    return await asyncio.gather(*[one(i) for i in range(n)])
 
 
 # ---------- compositing helpers ----------
@@ -159,6 +177,7 @@ async def run_generation(
         params.prompt, style_tags=params.style_tags, taste=taste, business=business
     )
     negative = build_negative_prompt(params.negative_prompt, taste=taste)
+    base_seed = _generation_base_seed(user_id, params.prompt)
 
     asset_records: list[Asset] = []
     bundle_type = "image_grid"
@@ -168,8 +187,12 @@ async def run_generation(
     if params.output_type in ("image", "style_transfer"):
         n = max(1, min(params.count or 3, 9))
         imgs = await _gen_many(
-            enriched, n,
-            negative_prompt=negative, width=width, height=height,
+            enriched,
+            n,
+            seed=base_seed,
+            negative_prompt=negative,
+            width=width,
+            height=height,
             reference_image_url=params.reference_image_url,
             reference_strength=params.reference_strength,
         )
@@ -184,7 +207,10 @@ async def run_generation(
     elif params.output_type == "poster":
         bg = await _gen_one(
             enriched + ", clean composition with empty space for text overlay",
-            negative_prompt=negative, width=width, height=height,
+            negative_prompt=negative,
+            width=width,
+            height=height,
+            seed=base_seed,
         )
         composed = _composite_poster(bg, params.poster_text, params.poster_layout)
         _, url = storage.save_bytes(composed, ".jpg")
@@ -208,8 +234,13 @@ async def run_generation(
                 _, ref_url = storage.save_bytes(prev, ".jpg", subdir="refs")
                 ref_strength = 0.3
             b = await _gen_one(
-                panel_prompt, negative_prompt=negative, width=width, height=height,
-                reference_image_url=ref_url, reference_strength=ref_strength,
+                panel_prompt,
+                negative_prompt=negative,
+                width=width,
+                height=height,
+                reference_image_url=ref_url,
+                reference_strength=ref_strength,
+                seed=_seed_variant(base_seed, i),
             )
             panels.append(b); prev = b
         for i, b in enumerate(panels, start=1):
@@ -223,7 +254,14 @@ async def run_generation(
 
     elif params.output_type == "vision_board":
         n = params.count if params.count in (4, 6, 9) else 6
-        imgs = await _gen_many(enriched, n, negative_prompt=negative, width=width, height=height)
+        imgs = await _gen_many(
+            enriched,
+            n,
+            seed=base_seed,
+            negative_prompt=negative,
+            width=width,
+            height=height,
+        )
         composed = _grid(imgs, cols=3 if n == 9 else (3 if n == 6 else 2))
         _, board_url = storage.save_bytes(composed, ".jpg")
         asset_records.append(Asset(
@@ -248,9 +286,13 @@ async def run_generation(
         if not params.reference_image_url:
             raise ValueError("before_after requires reference_image_url")
         after = await _gen_one(
-            enriched, negative_prompt=negative, width=width, height=height,
+            enriched,
+            negative_prompt=negative,
+            width=width,
+            height=height,
             reference_image_url=params.reference_image_url,
             reference_strength=params.reference_strength or 0.65,
+            seed=base_seed,
         )
         # fetch original
         import httpx as _h
@@ -268,7 +310,13 @@ async def run_generation(
 
     elif params.output_type == "video_loop":
         # Placeholder — generate a single still and return as a "video poster" until AnimateDiff is wired.
-        b = await _gen_one(enriched, negative_prompt=negative, width=width, height=height)
+        b = await _gen_one(
+            enriched,
+            negative_prompt=negative,
+            width=width,
+            height=height,
+            seed=base_seed,
+        )
         _, url = storage.save_bytes(b, ".jpg")
         asset_records.append(Asset(
             user_id=user_id, session_id=session_id, bundle_id=bundle_id,

@@ -63,17 +63,8 @@ class BasePipeline:
         return ratio if ratio in {"square", "landscape", "portrait"} else "square"
 
     def _personalized_prompt(self, ctx: PipelineContext, prompt: str) -> str:
-        parts = [prompt]
-        if ctx.business:
-            parts.append(
-                "Brand context: "
-                f"{ctx.business.business_name}, {ctx.business.business_type or 'business'}, "
-                f"tone {ctx.business.brand_tone or 'clear and polished'}, "
-                f"colors {ctx.business.brand_colors or {}}."
-            )
-        if ctx.taste and ctx.taste.taste_summary:
-            parts.append(f"User taste: {ctx.taste.taste_summary}.")
-        return " ".join(parts)
+        """Core user/refinement intent only — aesthetics come from ``build_image_prompt``."""
+        return prompt.strip()
 
 
 class ImagePipeline(BasePipeline):

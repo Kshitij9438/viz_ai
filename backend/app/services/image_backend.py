@@ -9,6 +9,7 @@ import asyncio
 import io
 import logging
 import random
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -68,10 +69,14 @@ class PollinationsBackend:
 
         Rate limiting and retry are handled by the caller via
         ``rate_limited_image_call`` — this method does ONE attempt.
-        Each call gets a fresh random seed to avoid duplicate request rejection.
+        Uses ``seed`` when provided; otherwise random (avoids duplicate cache hits).
         """
-        # Always use a fresh seed — prevents identical retries from being cached/rejected
-        seed = random.randint(1, 2**31 - 1)
+        if seed is None:
+            seed = random.randint(1, 2**31 - 1)
+        else:
+            seed = int(seed) % (2**31 - 1)
+            if seed <= 0:
+                seed = random.randint(1, 2**31 - 1)
         url = (
             f"https://image.pollinations.ai/prompt/{quote(prompt)}"
             f"?width={width}&height={height}&model=flux&nologo=true&seed={seed}"
@@ -135,7 +140,7 @@ class HuggingFaceBackend:
     def __init__(self) -> None:
         self.client = httpx.AsyncClient(timeout=180.0)
 
-    async def generate(self, prompt: str, **kw) -> bytes:
+    async def generate(self, prompt: str, *, seed: int | None = None, **kw: Any) -> bytes:
         if not settings.HF_TOKEN:
             raise RuntimeError("HF_TOKEN not set")
         api = "https://api-inference.huggingface.co/models/stabilityai/stable-diffusion-xl-base-1.0"
