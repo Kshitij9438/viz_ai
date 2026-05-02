@@ -344,11 +344,27 @@ export async function sendChat(body: {
 }
 
 export async function getJobStatus(jobId: string): Promise<JobStatusResponse> {
-  return parseResponse<JobStatusResponse>(
+  const raw = await parseResponse<Record<string, unknown>>(
     await apiFetch(`${API}/api/v1/jobs/${encodeURIComponent(jobId)}`, {
       headers: authHeaders(),
     }),
   );
+
+  let result = raw.result as JobResultPayload | null | undefined;
+  if ((result == null || typeof result !== "object") && raw.asset_bundle != null) {
+    result = { asset_bundle: raw.asset_bundle as AssetBundle };
+  }
+
+  return {
+    job_id: String(raw.job_id ?? jobId),
+    status: String(raw.status ?? ""),
+    result: result ?? null,
+    error: (raw.error as string | null | undefined) ?? null,
+    retry_after: typeof raw.retry_after === "number" ? raw.retry_after : null,
+    created_at: (raw.created_at as string | null | undefined) ?? null,
+    started_at: (raw.started_at as string | null | undefined) ?? null,
+    completed_at: (raw.completed_at as string | null | undefined) ?? null,
+  };
 }
 
 /** Normalize `asset_bundle` from a completed job's `result` (not top-level `response.asset_bundle`). */

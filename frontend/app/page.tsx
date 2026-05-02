@@ -60,6 +60,7 @@ export default function Page() {
   const endRef = useRef<HTMLDivElement>(null);
   const activeLoadRef = useRef(0);
   const activePollRef = useRef(0);
+  const jobPollAssistantIndexRef = useRef<number | null>(null);
   const restoredSessionRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
 
@@ -212,8 +213,6 @@ export default function Page() {
     setBusy(true);
     setMessages((current) => [...current, { role: "user", content: text, attachments }]);
 
-    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-
     try {
       const res = await sendChat({
         session_id: currentSessionId,
@@ -228,7 +227,7 @@ export default function Page() {
         setSessionId(res.session_id);
 
         if (res.job_id) {
-          let assistantMessageIndex = 0;
+          jobPollAssistantIndexRef.current = null;
           setMessages((current) => {
             const next = [
               ...current,
@@ -239,55 +238,72 @@ export default function Page() {
                 creative_output: null as ChatMessage["creative_output"],
               },
             ];
-            assistantMessageIndex = next.length - 1;
+            jobPollAssistantIndexRef.current = next.length - 1;
             return next;
           });
 
-          while (pollId === activePollRef.current) {
-            const job = await getJobStatus(res.job_id);
-            console.log("job response", job);
-            console.log("assets", job.result?.asset_bundle?.assets);
+          const MAX_JOB_POLLS = 200;
+          const applyJobToAssistant = (
+            mutate: (existing: ChatMessage) => ChatMessage,
+          ) => {
+            const idx = jobPollAssistantIndexRef.current;
+            setMessages((current) => {
+              if (idx === null || idx < 0 || idx >= current.length) return current;
+              const copy = [...current];
+              const existing = copy[idx];
+              if (existing?.role !== "assistant") return current;
+              copy[idx] = mutate(existing);
+              return copy;
+            });
+          };
 
-            if (pollId !== activePollRef.current) break;
+          const pollJob = (attempt: number): void => {
+            if (attempt >= MAX_JOB_POLLS || pollId !== activePollRef.current) return;
 
-            if (job.status === "done") {
-              const result = job.result;
-              const bundle = bundleFromJobResult(result);
-              const creative = creativeOutputFromJobResult(result);
-              const replyText = result?.reply ?? res.reply;
+            void (async () => {
+              if (pollId !== activePollRef.current) return;
+              try {
+                const job = await getJobStatus(res.job_id!);
+                console.log("job status", job.status);
+                console.log("job response", job);
+                console.log("assets", job.result?.asset_bundle?.assets);
 
-              setMessages((current) => {
-                const copy = [...current];
-                const existing = copy[assistantMessageIndex];
-                if (existing?.role !== "assistant") return current;
-                copy[assistantMessageIndex] = {
+                if (pollId !== activePollRef.current) return;
+
+                if (job.status === "done") {
+                  const result = job.result;
+                  const bundle = bundleFromJobResult(result);
+                  const creative = creativeOutputFromJobResult(result);
+                  const replyText = result?.reply ?? res.reply;
+                  applyJobToAssistant((existing) => ({
+                    ...existing,
+                    content: replyText,
+                    bundle,
+                    creative_output: creative,
+                  }));
+                  return;
+                }
+
+                if (job.status === "failed") {
+                  applyJobToAssistant((existing) => ({
+                    ...existing,
+                    content: `${existing.content}\n\n${job.error || "Generation failed."}`,
+                  }));
+                  return;
+                }
+
+                const delayMs = Math.max(500, (job.retry_after ?? 2) * 1000);
+                window.setTimeout(() => pollJob(attempt + 1), delayMs);
+              } catch {
+                applyJobToAssistant((existing) => ({
                   ...existing,
-                  content: replyText,
-                  bundle,
-                  creative_output: creative,
-                };
-                return copy;
-              });
-              break;
-            }
+                  content: `${existing.content}\n\nCould not load job status. Please try again.`,
+                }));
+              }
+            })();
+          };
 
-            if (job.status === "failed") {
-              setMessages((current) => {
-                const copy = [...current];
-                const existing = copy[assistantMessageIndex];
-                if (existing?.role !== "assistant") return current;
-                copy[assistantMessageIndex] = {
-                  ...existing,
-                  content: `${existing.content}\n\n${job.error || "Generation failed."}`,
-                };
-                return copy;
-              });
-              break;
-            }
-
-            const waitMs = Math.max(500, (job.retry_after ?? 2) * 1000);
-            await sleep(waitMs);
-          }
+          pollJob(0);
         } else {
           setMessages((current) => [
             ...current,

@@ -33,8 +33,24 @@ class JobStatusResponse(BaseModel):
     completed_at: Optional[str] = None
 
 
+def _unwrap_stored_result(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Worker stores a flat dict; tolerate accidental ``{"result": {...}}`` nesting."""
+    if not raw or not isinstance(raw, dict):
+        return raw
+    inner = raw.get("result")
+    if (
+        isinstance(inner, dict)
+        and ("asset_bundle" in inner or "reply" in inner)
+        and "asset_bundle" not in raw
+        and "reply" not in raw
+    ):
+        return inner
+    return raw
+
+
 def _normalize_job_result(result: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Normalize asset URLs in the stored job result."""
+    """Normalize asset URLs in the stored job result (always under API ``result`` key)."""
+    result = _unwrap_stored_result(result)
     if not result:
         return None
     normalized = dict(result)
@@ -84,10 +100,12 @@ async def get_job_status(
     elif job.status == "running":
         retry_after = 3
 
+    payload = _normalize_job_result(job.result) if job.status == "done" else None
+
     return JobStatusResponse(
         job_id=job.id,
         status=job.status,
-        result=_normalize_job_result(job.result) if job.status == "done" else None,
+        result=payload,
         error=job.error if job.status == "failed" else None,
         retry_after=retry_after,
         created_at=job.created_at.isoformat() if job.created_at else None,

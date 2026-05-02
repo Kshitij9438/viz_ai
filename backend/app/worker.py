@@ -219,27 +219,14 @@ class JobWorker:
                 )
                 return
 
-            # Phase 1 / 6: terminal & idempotency — never reprocess
-            if snapshot.status == "done":
+            # Terminal guard — never reprocess finished jobs (prevents duplicate runs / retries)
+            if snapshot.status in _TERMINAL:
                 logger.info(
                     "job_skipped",
                     extra={
                         "event": "job_skipped",
                         "job_id": job_id,
-                        "reason": "already_done",
-                        "status_before": snapshot.status,
-                        "status_after": snapshot.status,
-                    },
-                )
-                return
-
-            if snapshot.status == "failed":
-                logger.info(
-                    "job_skipped",
-                    extra={
-                        "event": "job_skipped",
-                        "job_id": job_id,
-                        "reason": "already_failed",
+                        "reason": "already_terminal",
                         "status_before": snapshot.status,
                         "status_after": snapshot.status,
                     },
@@ -348,6 +335,16 @@ class JobWorker:
                 job.completed_at = datetime.utcnow()
                 job.error = None
                 await db.commit()
+
+                logger.info(
+                    "job_finalized",
+                    extra={
+                        "event": "job_finalized",
+                        "job_id": job_id,
+                        "status": job.status,
+                        "has_result": bool(job.result),
+                    },
+                )
 
                 # Phase 5: nothing after success commit may affect DB state
                 try:
@@ -577,8 +574,12 @@ class JobWorker:
             )
             return
 
-        # Phase 7: retry only when attempts remain (claim increments attempts each try)
-        will_retry = job.attempts < settings.QUEUE_MAX_TRIES
+        # Never retry after success payload or terminal success
+        will_retry = (
+            job.status != "done"
+            and job.result is None
+            and job.attempts < settings.QUEUE_MAX_TRIES
+        )
 
         if will_retry:
             job.status = "pending"
