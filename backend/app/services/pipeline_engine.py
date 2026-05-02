@@ -69,7 +69,9 @@ class BasePipeline:
 
     def _personalized_prompt(self, ctx: PipelineContext, prompt: str) -> str:
         """Core user/refinement intent only — aesthetics come from ``build_image_prompt``."""
-        return prompt.strip()
+        cleaned = prompt.strip()
+        cleaned = re.sub(r"^style:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+        return cleaned
 
 
 class ImagePipeline(BasePipeline):
@@ -77,10 +79,12 @@ class ImagePipeline(BasePipeline):
 
     async def run(self, ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
         prompt = self._personalized_prompt(ctx, ctx.message)
+        raw_count = int(intent.parameters.get("count") or 3)
+        count = max(raw_count, 3)
         params = GenerateParams(
             output_type="image",
             prompt=prompt,
-            count=int(intent.parameters.get("count") or 3),
+            count=count,
             style_tags=self._style_tags(ctx, intent),
             aspect_ratio=self._aspect_ratio(intent),
         )

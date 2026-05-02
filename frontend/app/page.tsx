@@ -60,6 +60,7 @@ export default function Page() {
   const endRef = useRef<HTMLDivElement>(null);
   const activeLoadRef = useRef(0);
   const activePollRef = useRef(0);
+  const pollActiveRef = useRef(false);
   const jobPollAssistantIndexRef = useRef<number | null>(null);
   const restoredSessionRef = useRef(false);
   const sessionIdRef = useRef<string | null>(null);
@@ -78,6 +79,7 @@ export default function Page() {
 
   const loadSession = useCallback(async (nextSessionId: string) => {
     activePollRef.current += 1;
+    pollActiveRef.current = false;
     const loadId = activeLoadRef.current + 1;
     activeLoadRef.current = loadId;
     restoredSessionRef.current = true;
@@ -169,6 +171,7 @@ export default function Page() {
 
   function logout() {
     activePollRef.current += 1;
+    pollActiveRef.current = false;
     clearAuthState();
     setToken(null);
     setGuestToken(null);
@@ -183,6 +186,7 @@ export default function Page() {
 
   async function newChat() {
     activePollRef.current += 1;
+    pollActiveRef.current = false;
     const currentSessionId = sessionIdRef.current;
     activeLoadRef.current += 1;
     setSessionId(null);
@@ -206,6 +210,7 @@ export default function Page() {
     if (!text || busy || loadingHistory) return;
 
     const pollId = ++activePollRef.current;
+    pollActiveRef.current = false;
     const currentSessionId = sessionId;
     const attachments = pendingAttachments;
     setInput("");
@@ -227,6 +232,10 @@ export default function Page() {
         setSessionId(res.session_id);
 
         if (res.job_id) {
+          if (pollActiveRef.current) {
+            return;
+          }
+          pollActiveRef.current = true;
           jobPollAssistantIndexRef.current = null;
           setMessages((current) => {
             const next = [
@@ -242,7 +251,7 @@ export default function Page() {
             return next;
           });
 
-          const MAX_JOB_POLLS = 200;
+          const MAX_JOB_POLLS = 60;
           const applyJobToAssistant = (
             mutate: (existing: ChatMessage) => ChatMessage,
           ) => {
@@ -258,15 +267,15 @@ export default function Page() {
           };
 
           const pollJob = (attempt: number): void => {
-            if (attempt >= MAX_JOB_POLLS || pollId !== activePollRef.current) return;
+            if (attempt >= MAX_JOB_POLLS || pollId !== activePollRef.current) {
+              pollActiveRef.current = false;
+              return;
+            }
 
             void (async () => {
               if (pollId !== activePollRef.current) return;
               try {
                 const job = await getJobStatus(res.job_id!);
-                console.log("job status", job.status);
-                console.log("job response", job);
-                console.log("assets", job.result?.asset_bundle?.assets);
 
                 if (pollId !== activePollRef.current) return;
 
@@ -281,6 +290,7 @@ export default function Page() {
                     bundle,
                     creative_output: creative,
                   }));
+                  pollActiveRef.current = false;
                   return;
                 }
 
@@ -289,6 +299,7 @@ export default function Page() {
                     ...existing,
                     content: `${existing.content}\n\n${job.error || "Generation failed."}`,
                   }));
+                  pollActiveRef.current = false;
                   return;
                 }
 
@@ -299,12 +310,14 @@ export default function Page() {
                   ...existing,
                   content: `${existing.content}\n\nCould not load job status. Please try again.`,
                 }));
+                pollActiveRef.current = false;
               }
             })();
           };
 
           pollJob(0);
         } else {
+          pollActiveRef.current = false;
           setMessages((current) => [
             ...current,
             {
@@ -319,6 +332,7 @@ export default function Page() {
 
       await refreshSessions();
     } catch (error: any) {
+      pollActiveRef.current = false;
       setMessages((current) => [
         ...current,
         { role: "assistant", content: `Error: ${error.message}` },

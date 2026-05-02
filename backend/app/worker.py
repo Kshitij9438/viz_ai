@@ -255,10 +255,13 @@ class JobWorker:
         if isinstance(result_data.get("reply"), str) and result_data["reply"].strip():
             return True
 
-        # ANY asset bundle present counts as success (even if empty dict/list).
-        # Explicit variable avoids accidental truthiness bugs when bundle == {}.
+        # Generation success: bundle with assets.
         bundle = result_data.get("asset_bundle")
-        if bundle is not None:
+        if isinstance(bundle, dict) and bundle.get("assets"):
+            return True
+
+        # Fallback: explicit asset_bundle key presence still counts as success.
+        if "asset_bundle" in result_data:
             return True
 
         return False
@@ -282,62 +285,71 @@ class JobWorker:
         """
         status_before_ok = "running"
         async with AsyncSessionLocal() as db:
-            job = (
-                await db.execute(select(Job).where(Job.id == job_id))
-            ).scalar_one_or_none()
-            if job is None:
-                try:
-                    logger.warning(
-                        "job_finalize_success_job_missing",
+            try:
+                job = (
+                    await db.execute(select(Job).where(Job.id == job_id))
+                ).scalar_one_or_none()
+                if job is None:
+                    logger.error(
+                        "finalize_success_job_missing",
                         extra={
-                            "event": "job_finalize_success_job_missing",
+                            "event": "finalize_success_job_missing",
                             "job_id": job_id,
                             "run_id": run_id,
                         },
                     )
-                except Exception:
-                    pass
-                return
+                    return
 
-            if job.status in _TERMINAL:
-                try:
-                    logger.info(
-                        "job_skipped",
-                        extra={
-                            "event": "job_skipped",
-                            "job_id": job_id,
-                            "run_id": run_id,
-                            "reason": "already_terminal_before_success_persist",
-                            "status_before": job.status,
-                            "status_after": job.status,
-                        },
-                    )
-                except Exception:
-                    pass
-                return
+                if job.status in _TERMINAL:
+                    try:
+                        logger.info(
+                            "job_skipped",
+                            extra={
+                                "event": "job_skipped",
+                                "job_id": job_id,
+                                "run_id": run_id,
+                                "reason": "already_terminal_before_success_persist",
+                                "status_before": job.status,
+                                "status_after": job.status,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return
 
-            # Guard against double-finalization in race conditions.
-            if job.result is not None:
-                return
+                # Guard against double-finalization in race conditions.
+                if job.result is not None:
+                    return
 
-            # GAP 2/10 — Embed frontend polling hint and run identity in result metadata.
-            result_data.setdefault("_meta", {})
-            result_data["_meta"].update({
-                "run_id": run_id,
-                "poll_after_ms": 0,            # terminal — frontend should stop polling
-                "completed_at": datetime.utcnow().isoformat(),
-            })
+                # GAP 2/10 — Embed frontend polling hint and run identity in result metadata.
+                result_data.setdefault("_meta", {})
+                result_data["_meta"].update({
+                    "run_id": run_id,
+                    "poll_after_ms": 0,            # terminal — frontend should stop polling
+                    "completed_at": datetime.utcnow().isoformat(),
+                })
 
-            status_before_ok = job.status
-            job.status = "done"
-            job.result = result_data
-            job.completed_at = datetime.utcnow()
-            job.error = None
-            await db.commit()
-            logger.info(
-                "job_success_marker_v1",
-                extra={"job_id": job_id},
-            )
+                status_before_ok = job.status
+                job.status = "done"
+                job.result = result_data
+                job.completed_at = datetime.utcnow()
+                job.error = None
+                await db.commit()
+                logger.info(
+                    "job_success_marker_v1",
+                    extra={"job_id": job_id},
+                )
+            except Exception as exc:
+                logger.error(
+                    "finalize_success_failed",
+                    extra={
+                        "event": "finalize_success_failed",
+                        "job_id": job_id,
+                        "run_id": run_id,
+                        "error": str(exc),
+                    },
+                )
+                raise
 
         try:
             logger.info(
@@ -749,6 +761,8 @@ class JobWorker:
         )
         db.add(asst_msg)
         await db.commit()
+        # Lightweight post-commit sanity query to surface session health issues early.
+        await db.execute(select(Job.id).where(Job.id == job.id).limit(1))
 
         # GAP 4/5 — Take only the primary bundle; discard any extras produced by
         # fallback loops inside the pipeline to guarantee one job → one bundle.

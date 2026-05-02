@@ -246,7 +246,10 @@ def build_image_prompt(
     Total length capped at MAX_PROMPT_LENGTH by trimming the style segment only,
     never the user intent.
     """
+    # Defensive: strip accidental "Style:" prefix leaking into user intent.
     intent = (base_prompt or "").strip().rstrip(".")
+    if intent.lower().startswith("style:"):
+        intent = re.sub(r"^style:\s*", "", intent, flags=re.IGNORECASE).strip()
     if not intent:
         intent = _DEFAULT_INTENT
 

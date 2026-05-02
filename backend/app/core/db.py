@@ -3,6 +3,7 @@ from __future__ import annotations
 import ssl
 import logging
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -39,6 +40,8 @@ def _connect_args(database_url: str) -> dict:
             "ssl": _build_ssl_context(database_url),
             "statement_cache_size": 0,  # safer for serverless / pooled infra
         }
+    if database_url.startswith("sqlite"):
+        return {"check_same_thread": False}
     return {}
 
 
@@ -57,6 +60,14 @@ engine = create_async_engine(
 
     connect_args=_connect_args(settings.DATABASE_URL),
 )
+
+if settings.DATABASE_URL.startswith("sqlite"):
+    @event.listens_for(engine.sync_engine, "connect")
+    def set_sqlite_pragma(dbapi_conn, connection_record):  # type: ignore[unused-argument]
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 
 # ✅ Session factory

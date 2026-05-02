@@ -351,6 +351,15 @@ export async function getJobStatus(jobId: string): Promise<JobStatusResponse> {
   );
 
   let result = raw.result as JobResultPayload | null | undefined;
+  if (
+    result &&
+    typeof result === "object" &&
+    "result" in result &&
+    !("asset_bundle" in result) &&
+    !("reply" in result)
+  ) {
+    result = (result as { result?: JobResultPayload }).result;
+  }
   if ((result == null || typeof result !== "object") && raw.asset_bundle != null) {
     result = { asset_bundle: raw.asset_bundle as AssetBundle };
   }

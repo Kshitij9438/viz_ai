@@ -25,7 +25,7 @@ class GenerateParams(BaseModel):
     prompt: str
     style_tags: list[str] = Field(default_factory=list)
     negative_prompt: Optional[str] = None
-    count: int = 1
+    count: int = 3
     reference_image_url: Optional[str] = None
     reference_strength: Optional[float] = None
     aspect_ratio: Optional[Literal["square", "landscape", "portrait"]] = "square"
