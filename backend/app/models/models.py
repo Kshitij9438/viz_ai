@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -43,6 +43,8 @@ class Session(Base):
     # Tracking the active asset (most recently selected variant)
     active_asset_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     last_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Accumulated design cues for guided generation (subject, style, colors, mood)
+    design_context: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
 
 class Message(Base):

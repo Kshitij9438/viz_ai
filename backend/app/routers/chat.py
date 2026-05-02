@@ -1,5 +1,6 @@
 #from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -19,9 +20,18 @@ from app.memory.memory import (
 from app.models.models import Job, Session as SessionModel, User
 from app.services.storage import public_asset_url
 from app.services.conversation import converse
+from app.services.design_context import (
+    build_resolved_user_message,
+    is_ready,
+    merge_design_context,
+    readiness_state,
+    soft_escalate_to_confirmation,
+)
+from app.services.generation_intent_gate import classify_generation_mode
 from app.services.intent_engine import classify_intent
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
+_chat_log = logging.getLogger("vizzy.chat")
 
 
 class Attachment(BaseModel):
@@ -139,6 +149,27 @@ async def chat(
     user = identity.user
     session = await _get_or_create_session(db, req.session_id, user.id)
 
+    design_ctx = merge_design_context(getattr(session, "design_context", None) or {}, req.message)
+    session.design_context = dict(design_ctx)
+    await db.flush()
+
+    _chat_log.info(
+        "context_updated",
+        extra={
+            "event": "context_updated",
+            "session_id": session.id,
+            "subject": bool(design_ctx.get("subject")),
+            "style": bool(design_ctx.get("style")),
+            "colors": bool(design_ctx.get("colors")),
+            "mood": bool(design_ctx.get("mood")),
+        },
+    )
+    rs_log = readiness_state(design_ctx)
+    _chat_log.info(
+        "readiness_state",
+        extra={"event": "readiness_state", "session_id": session.id, **rs_log},
+    )
+
     # ---- Step 1: Classify intent (1 LLM call, ~1-3s, acceptable) ----
     from app.memory.memory import get_or_create_taste, get_business, get_recent_messages
     taste = await get_or_create_taste(db, session.user_id)
@@ -157,6 +188,89 @@ async def chat(
         # Fallback to regex-based classification (never crash)
         from app.services.intent_engine import _fallback_intent
         intent = _fallback_intent(req.message, [a.model_dump() for a in req.attachments] if req.attachments else None)
+
+    # ---- Step 1b: Gate image/edit — guided flow; enqueue only on generate or confirm+ready ----
+    if intent.intent in ("image", "edit"):
+        gate_mode = classify_generation_mode(
+            req.message, has_attachments=bool(req.attachments)
+        )
+        ready = is_ready(design_ctx)
+        soft_ready = soft_escalate_to_confirmation(design_ctx)
+        confirm_turn = ready or soft_ready
+        _chat_log.info(
+            "intent_classified",
+            extra={
+                "event": "intent_classified",
+                "intent": gate_mode,
+                "message": req.message[:500],
+                "pipeline_intent": intent.intent,
+                "design_ready": ready,
+                "soft_escalate": soft_ready,
+            },
+        )
+
+        async def _gated_converse_response(conv_kw: dict[str, Any]) -> ChatResponse:
+            try:
+                result = await converse(
+                    db,
+                    session=session,
+                    user_message=req.message,
+                    attachments=[a.model_dump() for a in req.attachments] if req.attachments else None,
+                    design_context=dict(design_ctx),
+                    **conv_kw,
+                )
+            except Exception:
+                result = {
+                    "reply": "I hit a temporary issue. Your session is safe. Please try again in a moment.",
+                    "asset_bundle": None,
+                    "creative_output": None,
+                    "intent": None,
+                    "tool_call": None,
+                }
+            intent_payload = intent.model_dump()
+            intent_payload["generation_gate"] = gate_mode
+            intent_payload["design_context"] = dict(design_ctx)
+            return ChatResponse(
+                reply=str(result.get("reply") or "Tell me more."),
+                job_id=None,
+                job_status=None,
+                asset_bundle=_normalize_bundle(result.get("asset_bundle")),
+                creative_output=_normalize_creative_output(result.get("creative_output")),
+                intent=intent_payload,
+                tool_call=result.get("tool_call"),
+                session_id=session.id,
+                user_id=user.id,
+                guest_token=identity.guest_token,
+            )
+
+        if gate_mode == "chat":
+            return await _gated_converse_response(
+                {"force_chat_pipeline": True, "refinement_mode": False},
+            )
+
+        if gate_mode == "refine" and confirm_turn:
+            return await _gated_converse_response(
+                {
+                    "force_chat_pipeline": True,
+                    "refinement_mode": False,
+                    "awaiting_confirmation": True,
+                },
+            )
+
+        if gate_mode == "refine" and not confirm_turn:
+            return await _gated_converse_response(
+                {"force_chat_pipeline": True, "refinement_mode": True},
+            )
+
+        if gate_mode == "confirm" and not ready:
+            return await _gated_converse_response(
+                {"force_chat_pipeline": True, "refinement_mode": True},
+            )
+
+        if not (gate_mode == "generate" or (gate_mode == "confirm" and ready)):
+            return await _gated_converse_response(
+                {"force_chat_pipeline": True, "refinement_mode": True},
+            )
 
     # ---- Step 2: Chat-only (no generation) → sync fast path ----
     if intent.intent not in _GENERATION_INTENTS:
@@ -189,11 +303,14 @@ async def chat(
 
     # ---- Step 3: Generation intent → enqueue job, return fast ----
 
+    job_user_message = req.message
+    if intent.intent in ("image", "edit"):
+        job_user_message = build_resolved_user_message(req.message, design_ctx)
+
     # Dedup check
-    existing_job_id = await check_dedup(user.id, session.id, req.message)
+    existing_job_id = await check_dedup(user.id, session.id, job_user_message)
     if existing_job_id:
-        import logging
-        logging.getLogger("vizzy.chat").info(
+        _chat_log.info(
             "dedup_hit",
             extra={"event": "dedup_hit", "job_id": existing_job_id, "user_id": user.id},
         )
@@ -211,7 +328,7 @@ async def chat(
         user_id=user.id,
         session_id=session.id,
         type="generation",
-        message=req.message,
+        message=job_user_message,
         attachments_json=[a.model_dump() for a in req.attachments] if req.attachments else None,
         intent_data=intent.model_dump(),
         status="pending",
@@ -236,7 +353,7 @@ async def chat(
         )
 
     # Set dedup marker
-    await set_dedup(user.id, session.id, req.message, job.id)
+    await set_dedup(user.id, session.id, job_user_message, job.id)
 
     # Reply type mapping for friendly messages
     _type_names = {

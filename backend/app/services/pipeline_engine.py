@@ -25,6 +25,9 @@ class PipelineContext:
     taste: UserTasteProfile | None
     business: BusinessProfile | None
     session_last_prompt: str | None = None
+    refinement_mode: bool = False
+    awaiting_confirmation: bool = False
+    design_context: dict[str, Any] | None = None
 
 
 @dataclass
@@ -297,10 +300,56 @@ class ChatPipeline(BasePipeline):
     name = "chat_pipeline"
 
     async def run(self, ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
-        response = await ollama.complete(
-            "Reply as Vizzy, a concise creative co-pilot. Ask at most one useful question.\n\n"
-            f"User: {ctx.message}"
-        )
+        from app.services.design_context import format_confirmation, is_ready, readiness_state
+
+        if ctx.awaiting_confirmation:
+            dc = ctx.design_context or {}
+            if is_ready(dc):
+                response = format_confirmation(dc)
+            else:
+                response = await ollama.complete(
+                    "Reply as Vizzy. The user's direction is still a bit open. "
+                    "Ask ONE short, concrete question about what they want made (subject, product, or scene) "
+                    "or the deliverable type (logo, poster, social graphic, etc.). "
+                    "Do not say you are generating images yet.\n\n"
+                    f"User: {ctx.message}"
+                )
+        elif ctx.refinement_mode:
+            hint = ""
+            if ctx.design_context and any(ctx.design_context.get(k) for k in ("subject", "style", "colors", "mood")):
+                hint = f"\nDesign cues so far: {ctx.design_context}\n"
+            rs = readiness_state(ctx.design_context or {})
+            subj = (ctx.design_context or {}).get("subject") if ctx.design_context else None
+            focus = subj.strip() if isinstance(subj, str) and subj.strip() else None
+            if not rs.get("has_subject"):
+                gap = (
+                    "Ask what they want made or shown (subject, product, scene). "
+                    "Keep it to ONE question."
+                )
+            elif not rs.get("has_visual_cue"):
+                fk = focus or "this"
+                gap = (
+                    f"When asking about palette or mood, prefer wording like "
+                    f"'For {fk}, any color preference?' or similar if it fits. "
+                    "Keep ONE question about style, colors, or mood."
+                )
+            else:
+                gap = (
+                    "Ask ONE precise question to tighten direction before generating "
+                    "(format, audience, or one visual detail)."
+                )
+            response = await ollama.complete(
+                "Reply as Vizzy. The user is steering creative direction but has not asked you to "
+                "generate images yet. "
+                + gap
+                + " Do not say you are generating, rendering, or creating images right now."
+                f"{hint}\nUser: {ctx.message}"
+            )
+        else:
+            response = await ollama.complete(
+                "Reply as Vizzy, a concise creative co-pilot. Ask at most one useful question.\n\n"
+                f"User: {ctx.message}"
+            )
         return PipelineResult(
             reply=response or "Tell me what you want to create, and I can shape it into a visual direction.",
             creative_output={"type": "chat", "outputs": [], "metadata": {"intent": intent.model_dump()}},

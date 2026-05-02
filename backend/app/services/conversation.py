@@ -15,7 +15,7 @@ from app.memory.memory import (
 )
 from app.models.models import BusinessProfile, Message, UserTasteProfile
 from app.pipelines.router import run_generation
-from app.services.intent_engine import classify_intent
+from app.services.intent_engine import IntentResult, PIPELINE_STEPS, classify_intent
 from app.services.pipeline_engine import PipelineContext, execute_pipeline
 from app.services.generate_tool import GENERATE_TOOL_SCHEMA, GenerateParams
 from app.services.ollama_client import ollama
@@ -194,6 +194,10 @@ async def converse(
     session,
     user_message: str,
     attachments: list[dict] | None = None,
+    force_chat_pipeline: bool = False,
+    refinement_mode: bool = False,
+    awaiting_confirmation: bool = False,
+    design_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
 
     # -------- CONTEXT -------- #
@@ -250,13 +254,25 @@ async def converse(
     await db.commit()
 
     # -------- CREATIVE OS INTENT + PIPELINE -------- #
-    intent = await classify_intent(
-        message=user_message,
-        attachments=attachments,
-        recent_messages=recent_msgs,
-        taste=taste,
-        business=business,
-    )
+    if force_chat_pipeline:
+        intent = IntentResult(
+            intent="chat",
+            pipeline="chat_pipeline",
+            steps=PIPELINE_STEPS["chat_pipeline"],
+            confidence=1.0,
+            execute=False,
+            parameters={},
+        )
+    else:
+        intent = await classify_intent(
+            message=user_message,
+            attachments=attachments,
+            recent_messages=recent_msgs,
+            taste=taste,
+            business=business,
+        )
+
+    dc = design_context if design_context is not None else getattr(session, "design_context", None)
 
     result = await execute_pipeline(
         PipelineContext(
@@ -269,6 +285,9 @@ async def converse(
             taste=taste,
             business=business,
             session_last_prompt=session.last_prompt,
+            refinement_mode=refinement_mode,
+            awaiting_confirmation=awaiting_confirmation,
+            design_context=dc if isinstance(dc, dict) else None,
         ),
         intent,
     )
