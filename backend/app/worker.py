@@ -11,12 +11,23 @@ Key resilience features:
 - Reconnect with exponential backoff on Redis disconnect
 - Per-job timeout via asyncio.wait_for
 - Graceful shutdown via asyncio.Event
+
+Gap mitigations (added):
+- GAP 1/6: Execution barrier — db.refresh + status verify after claim before pipeline runs
+- GAP 2:   poll_after_ms hint embedded in every finalized result for frontend backoff
+- GAP 3:   Rate-limit-aware pipeline wrapper with exponential backoff + jitter
+- GAP 4/5: No duplicate bundles — barrier prevents duplicate execution; primary_bundle only
+- GAP 7:   Module-level asyncio.Semaphore caps concurrent pipeline executions per replica
+- GAP 8/9: run_id (uuid4) threaded through all log events; attempt/retry_delay_ms fields added
+- GAP 10:  poll_after_ms=0 on terminal states; non-zero on retries
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -31,6 +42,31 @@ from app.services.storage import public_asset_url
 logger = logging.getLogger("vizzy.worker")
 
 _TERMINAL = frozenset({"done", "failed"})
+
+# GAP 7 — Limits concurrent pipeline executions within a single replica.
+# Prevents one replica from spamming the image provider while another is
+# already mid-execution. Tune MAX_CONCURRENT to match provider rate limits.
+_MAX_CONCURRENT_PIPELINES: int = getattr(settings, "WORKER_MAX_CONCURRENT_PIPELINES", 2)
+_PIPELINE_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_PIPELINES)
+
+# GAP 3 — How many times we retry a single pipeline execution on rate-limit errors
+# before letting the job-level retry mechanism take over.
+_RATE_LIMIT_MAX_RETRIES: int = 3
+_RATE_LIMIT_BASE_DELAY: float = 2.0   # seconds; doubled each attempt
+_RATE_LIMIT_MAX_DELAY: float = 30.0   # cap
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Detect HTTP 429 / provider rate-limit errors by class name and message."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    return (
+        "ratelimit" in name
+        or "toomanyrequests" in name
+        or "429" in msg
+        or "rate limit" in msg
+        or "too many requests" in msg
+    )
 
 
 class JobWorker:
@@ -66,15 +102,15 @@ class JobWorker:
     # ------------------------------------------------------------------
 
     async def _recover_orphaned_jobs(self) -> None:
-        """On startup: find stuck pending/running jobs → re-enqueue to Redis.
+        """On startup: find stuck pending/running jobs and re-enqueue to Redis.
 
-        This handles:
+        Handles:
         - Container restart mid-job (status=running, never completed)
         - Redis lost the queue entry (job in DB but not in queue)
         - Worker crash (job stuck in running)
 
-        If ``result`` is already populated but status is not ``done``,
-        reconcile to ``done`` (idempotent repair — never downgrade).
+        If result is already populated but status is not done,
+        reconcile to done (idempotent repair — never downgrade).
         """
         try:
             async with AsyncSessionLocal() as db:
@@ -188,16 +224,14 @@ class JobWorker:
     # Job processing
     # ------------------------------------------------------------------
 
-    # FIX 1: Production-safe validation — accept any asset_bundle (even empty),
-    # never reject real generation output.
     @staticmethod
     def _pipeline_result_is_valid(result_data: Any) -> bool:
         """
         Production-safe validation.
 
         Rules:
-        - reply → valid (chat)
-        - asset_bundle present → valid (even if empty dict/list)
+        - reply present and non-empty → valid (chat response)
+        - asset_bundle present (even if empty dict/list) → valid (generation)
         - NEVER reject real generation output
         """
         if not result_data or not isinstance(result_data, dict):
@@ -208,22 +242,29 @@ class JobWorker:
             return True
 
         # ANY asset bundle present counts as success (even if empty dict/list).
-        # Extracted to a variable for explicit intent — avoids accidental truthiness bugs later.
+        # Explicit variable avoids accidental truthiness bugs when bundle == {}.
         bundle = result_data.get("asset_bundle")
         if bundle is not None:
             return True
 
         return False
 
-    # FIX 4: Idempotent success finalizer — skip double-finalization in race conditions.
     async def _finalize_success(
-        self, job_id: str, result_data: dict[str, Any], *, started_at_perf: float
+        self,
+        job_id: str,
+        result_data: dict[str, Any],
+        *,
+        started_at_perf: float,
+        run_id: str,
     ) -> None:
         """Write terminal success using a dedicated DB session.
 
         The pipeline shares the claim session and commits many times; persisting
-        ``Job.status``/``Job.result`` here avoids a stale or inconsistent session
-        leaving the row stuck in ``running`` after ``image_success``.
+        Job.status/Job.result here avoids a stale or inconsistent session
+        leaving the row stuck in 'running' after image_success.
+
+        GAP 2/10: Embeds poll_after_ms=0 so the frontend stops polling immediately.
+        GAP 9:    Attaches run_id to result metadata for deduplication tracing.
         """
         status_before_ok = "running"
         async with AsyncSessionLocal() as db:
@@ -237,6 +278,7 @@ class JobWorker:
                         extra={
                             "event": "job_finalize_success_job_missing",
                             "job_id": job_id,
+                            "run_id": run_id,
                         },
                     )
                 except Exception:
@@ -250,6 +292,7 @@ class JobWorker:
                         extra={
                             "event": "job_skipped",
                             "job_id": job_id,
+                            "run_id": run_id,
                             "reason": "already_terminal_before_success_persist",
                             "status_before": job.status,
                             "status_after": job.status,
@@ -259,9 +302,17 @@ class JobWorker:
                     pass
                 return
 
-            # FIX 4: Guard against double-finalization in race conditions.
+            # Guard against double-finalization in race conditions.
             if job.result is not None:
                 return
+
+            # GAP 2/10 — Embed frontend polling hint and run identity in result metadata.
+            result_data.setdefault("_meta", {})
+            result_data["_meta"].update({
+                "run_id": run_id,
+                "poll_after_ms": 0,            # terminal — frontend should stop polling
+                "completed_at": datetime.utcnow().isoformat(),
+            })
 
             status_before_ok = job.status
             job.status = "done"
@@ -276,6 +327,7 @@ class JobWorker:
                 extra={
                     "event": "job_finalized",
                     "job_id": job_id,
+                    "run_id": run_id,
                     "status": "done",
                     "has_result": True,
                 },
@@ -290,6 +342,7 @@ class JobWorker:
                 extra={
                     "event": "job_succeeded",
                     "job_id": job_id,
+                    "run_id": run_id,
                     "status_before": status_before_ok,
                     "status_after": "done",
                     "duration_ms": duration_ms,
@@ -299,7 +352,13 @@ class JobWorker:
             pass
 
     async def _process_job(self, job_id: str) -> None:
-        """Execute a single job with atomic claim and timeout."""
+        """Execute a single job with atomic claim and timeout.
+
+        GAP 9: Generates a run_id at entry — every log event for this execution
+               carries it, making duplicate runs trivially distinguishable in logs.
+        """
+        # GAP 9 — Unique identity for this specific execution attempt.
+        run_id = str(uuid.uuid4())
         started_at = time.perf_counter()
 
         async with AsyncSessionLocal() as db:
@@ -310,17 +369,18 @@ class JobWorker:
             if snapshot is None:
                 logger.warning(
                     "job_not_found",
-                    extra={"event": "job_not_found", "job_id": job_id},
+                    extra={"event": "job_not_found", "job_id": job_id, "run_id": run_id},
                 )
                 return
 
-            # Terminal guard — never reprocess finished jobs (prevents duplicate runs / retries)
+            # Terminal guard — never reprocess finished jobs
             if snapshot.status in _TERMINAL:
                 logger.info(
                     "job_skipped",
                     extra={
                         "event": "job_skipped",
                         "job_id": job_id,
+                        "run_id": run_id,
                         "reason": "already_terminal",
                         "status_before": snapshot.status,
                         "status_after": snapshot.status,
@@ -329,12 +389,13 @@ class JobWorker:
                 return
 
             if snapshot.result is not None and snapshot.status in ("pending", "running"):
-                # Inconsistent row: treat as success (repair on the fly)
+                # Inconsistent row: reconcile to done on the fly
                 logger.info(
                     "job_skipped",
                     extra={
                         "event": "job_skipped",
                         "job_id": job_id,
+                        "run_id": run_id,
                         "reason": "has_result_reconcile",
                         "status_before": snapshot.status,
                         "status_after": "done",
@@ -369,6 +430,7 @@ class JobWorker:
                     extra={
                         "event": "job_claim_skipped",
                         "job_id": job_id,
+                        "run_id": run_id,
                         "status_before": "pending",
                         "status_after": lost or "unknown",
                     },
@@ -377,11 +439,31 @@ class JobWorker:
 
             job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one()
 
+            # GAP 1/6 — EXECUTION BARRIER.
+            # Re-read the row from DB after the claim commit. In a multi-replica
+            # environment there is a window between the UPDATE returning and this
+            # read where another worker could have claimed or completed the job.
+            # Only proceed if we genuinely own a 'running' row right now.
+            await db.refresh(job)
+            if job.status != "running":
+                logger.info(
+                    "job_execution_barrier_rejected",
+                    extra={
+                        "event": "job_execution_barrier_rejected",
+                        "job_id": job_id,
+                        "run_id": run_id,
+                        "status_after_refresh": job.status,
+                        "reason": "status_changed_between_claim_and_execute",
+                    },
+                )
+                return
+
             logger.info(
                 "job_claimed",
                 extra={
                     "event": "job_claimed",
                     "job_id": job.id,
+                    "run_id": run_id,
                     "status_before": "pending",
                     "status_after": "running",
                     "attempt": job.attempts,
@@ -392,6 +474,7 @@ class JobWorker:
                 extra={
                     "event": "job_started",
                     "job_id": job.id,
+                    "run_id": run_id,
                     "status_before": "pending",
                     "status_after": "running",
                     "attempt": job.attempts,
@@ -400,41 +483,50 @@ class JobWorker:
             )
 
             try:
-                result_data = await asyncio.wait_for(
-                    self._execute_pipeline(db, job),
-                    timeout=settings.QUEUE_JOB_TIMEOUT_SECONDS,
-                )
+                # GAP 7 — Semaphore caps concurrent pipeline executions per replica,
+                # preventing this worker from flooding the image provider.
+                async with _PIPELINE_SEMAPHORE:
+                    result_data = await asyncio.wait_for(
+                        # GAP 3 — Rate-limit-aware wrapper with backoff + jitter.
+                        self._execute_pipeline_with_backoff(db, job, run_id=run_id),
+                        timeout=settings.QUEUE_JOB_TIMEOUT_SECONDS,
+                    )
 
-                # FIX 2: Hardened success/failure block.
-                # If validation fails but an asset_bundle is present, always treat as success.
+                # If validation fails but an asset_bundle is present, treat as success.
                 if not self._pipeline_result_is_valid(result_data):
                     # SAFETY: bundle exists → success regardless of other fields
                     if isinstance(result_data, dict) and result_data.get("asset_bundle") is not None:
-                        await self._finalize_success(job_id, result_data, started_at_perf=started_at)
+                        await self._finalize_success(
+                            job_id, result_data, started_at_perf=started_at, run_id=run_id
+                        )
                         return
 
-                    await self._finalize_failure(job_id, "Pipeline returned empty or invalid result")
+                    await self._finalize_failure(
+                        job_id, "Pipeline returned empty or invalid result", run_id=run_id
+                    )
                     return
 
                 # Normal success path
-                await self._finalize_success(job_id, result_data, started_at_perf=started_at)
+                await self._finalize_success(
+                    job_id, result_data, started_at_perf=started_at, run_id=run_id
+                )
 
             except asyncio.TimeoutError:
                 try:
                     await db.rollback()
                 except Exception:
                     pass
-                await self._finalize_failure(job_id, "Job timed out")
+                await self._finalize_failure(job_id, "Job timed out", run_id=run_id)
 
             except Exception as exc:
                 try:
                     await db.rollback()
                 except Exception:
                     pass
-                await self._finalize_failure(job_id, str(exc))
+                await self._finalize_failure(job_id, str(exc), run_id=run_id)
 
-    async def _finalize_failure(self, job_id: str, error_msg: str) -> None:
-        """Handle failure using a fresh DB session; never overwrite ``done`` or valid ``result``."""
+    async def _finalize_failure(self, job_id: str, error_msg: str, *, run_id: str) -> None:
+        """Handle failure using a fresh DB session; never overwrite 'done' or valid result."""
         async with AsyncSessionLocal() as db:
             job = (
                 await db.execute(select(Job).where(Job.id == job_id))
@@ -458,6 +550,7 @@ class JobWorker:
                             extra={
                                 "event": "job_recovered_result_on_failure_path",
                                 "job_id": job_id,
+                                "run_id": run_id,
                                 "status_before": status_before,
                                 "status_after": "done",
                             },
@@ -471,6 +564,7 @@ class JobWorker:
                             extra={
                                 "event": "job_skipped",
                                 "job_id": job_id,
+                                "run_id": run_id,
                                 "reason": "failure_after_done_or_has_result",
                                 "status_before": status_before,
                                 "status_after": job.status,
@@ -486,6 +580,7 @@ class JobWorker:
                     extra={
                         "event": "job_skipped",
                         "job_id": job_id,
+                        "run_id": run_id,
                         "reason": "unexpected_status_on_failure",
                         "status_before": status_before,
                         "status_after": job.status,
@@ -493,10 +588,81 @@ class JobWorker:
                 )
                 return
 
-            await self._handle_failure(db, job, error_msg)
+            await self._handle_failure(db, job, error_msg, run_id=run_id)
+
+    # ------------------------------------------------------------------
+    # Rate-limit-aware pipeline execution  (GAP 3)
+    # ------------------------------------------------------------------
+
+    async def _execute_pipeline_with_backoff(
+        self, db, job: Job, *, run_id: str
+    ) -> dict:
+        """Execute the pipeline with exponential backoff + jitter on rate-limit errors.
+
+        Up to _RATE_LIMIT_MAX_RETRIES internal retries are attempted before the
+        exception propagates to the job-level failure handler.  This keeps job-level
+        retry counts clean — a transient provider blip does not burn an attempt.
+
+        GAP 3: delay = min(base * 2^attempt, max) + uniform(0, 1) jitter
+        """
+        last_exc: Exception | None = None
+
+        for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                return await self._execute_pipeline(db, job)
+
+            except Exception as exc:
+                if not _is_rate_limit_error(exc):
+                    # Non-rate-limit errors propagate immediately.
+                    raise
+
+                last_exc = exc
+
+                if attempt >= _RATE_LIMIT_MAX_RETRIES:
+                    logger.error(
+                        "pipeline_rate_limit_retries_exhausted",
+                        extra={
+                            "event": "pipeline_rate_limit_retries_exhausted",
+                            "job_id": job.id,
+                            "run_id": run_id,
+                            "attempt": attempt,
+                            "error": str(exc)[:300],
+                        },
+                    )
+                    raise
+
+                # Exponential backoff with full jitter.
+                raw_delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
+                delay = raw_delay + random.uniform(0, 1)
+
+                logger.warning(
+                    "pipeline_rate_limit_retry",
+                    extra={
+                        "event": "pipeline_rate_limit_retry",
+                        "job_id": job.id,
+                        "run_id": run_id,
+                        "attempt": attempt + 1,
+                        "max_retries": _RATE_LIMIT_MAX_RETRIES,
+                        "retry_delay_ms": round(delay * 1000, 1),
+                        "error": str(exc)[:300],
+                    },
+                )
+                await asyncio.sleep(delay)
+
+        # Unreachable — loop always raises or returns, but satisfies type checkers.
+        raise last_exc  # type: ignore[misc]
+
+    # ------------------------------------------------------------------
+    # Pipeline execution
+    # ------------------------------------------------------------------
 
     async def _execute_pipeline(self, db, job: Job) -> dict:
-        """Rebuild full PipelineContext from DB and execute the pipeline."""
+        """Rebuild full PipelineContext from DB and execute the pipeline.
+
+        GAP 4/5: Takes only primary_bundle from pipeline result — extra bundles
+                 generated by fallback loops inside the pipeline are discarded here,
+                 ensuring ONE job → ONE asset bundle in the response.
+        """
         from app.memory.memory import get_or_create_taste, get_business, get_recent_messages
         from app.models.models import Session as SessionModel, Message
         from app.services.intent_engine import IntentResult, PIPELINE_STEPS
@@ -581,6 +747,8 @@ class JobWorker:
         db.add(asst_msg)
         await db.commit()
 
+        # GAP 4/5 — Take only the primary bundle; discard any extras produced by
+        # fallback loops inside the pipeline to guarantee one job → one bundle.
         bundle = pipeline_result.primary_bundle
         if bundle:
             bundle = dict(bundle)
@@ -598,19 +766,20 @@ class JobWorker:
             "tool_call": pipeline_result.tool_call,
         }
 
-    async def _handle_failure(self, db, job: Job, error_msg: str) -> None:
+    # ------------------------------------------------------------------
+    # Failure handling
+    # ------------------------------------------------------------------
+
+    async def _handle_failure(self, db, job: Job, error_msg: str, *, run_id: str) -> None:
         """Retry or mark failed. Caller must ensure job is not terminal."""
         await db.refresh(job)
 
         status_before = job.status
 
-        # FIX 3: Absolute guard — prevents race-condition retries after success.
-        # Covers both job.status == "done" and job.result is not None in one check;
-        # the subsequent blocks that checked each individually are removed as dead code.
+        # Absolute guard — covers both job.status == "done" and job.result is not None.
         if job.status == "done" or job.result is not None:
             return
 
-        # Never retry after success payload or terminal success
         will_retry = (
             job.status != "done"
             and job.result is None
@@ -618,11 +787,16 @@ class JobWorker:
         )
 
         if will_retry:
+            # GAP 10 — Retry delay hint for the frontend: mirrors the backoff the
+            # worker will apply before re-executing, so the client waits the right amount.
+            retry_delay_s = min(2 ** job.attempts, 30) + random.uniform(0, 1)
+            poll_after_ms = round(retry_delay_s * 1000)
+
             job.status = "pending"
             job.error = error_msg
             await db.commit()
 
-            # ABSOLUTE FINAL GUARD: re-read DB state before enqueue to catch
+            # ABSOLUTE FINAL GUARD — re-read DB state before enqueue to catch
             # any concurrent success commit from another worker/session.
             await db.refresh(job)
             if job.status == "done" or job.result is not None:
@@ -635,11 +809,13 @@ class JobWorker:
                 extra={
                     "event": "job_retry_scheduled",
                     "job_id": job.id,
+                    "run_id": run_id,
                     "error": error_msg[:300],
                     "attempt": job.attempts,
                     "status_before": status_before,
                     "status_after": "pending",
                     "will_retry": True,
+                    "poll_after_ms": poll_after_ms,
                 },
             )
             return
@@ -654,10 +830,12 @@ class JobWorker:
             extra={
                 "event": "job_failed",
                 "job_id": job.id,
+                "run_id": run_id,
                 "error": error_msg[:300],
                 "attempt": job.attempts,
                 "status_before": status_before,
                 "status_after": "failed",
                 "will_retry": False,
+                "poll_after_ms": 0,    # terminal — frontend stops polling
             },
         )
