@@ -10,7 +10,7 @@ load_dotenv()
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    ENVIRONMENT: str = "development"
+    ENVIRONMENT: str = "production"
 
     # LLM
     GITHUB_TOKEN: str = Field(default="", repr=False)
@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 10080
     GUEST_JWT_EXPIRE_HOURS: int = 48
+    ALLOW_GUEST_CHAT: bool | None = None
 
     @field_validator("FRONTEND_ORIGIN")
     @classmethod
@@ -60,7 +61,16 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_settings(self) -> "Settings":
-        if self.ENVIRONMENT.lower() in {"production", "prod"}:
+        env = self.ENVIRONMENT.lower()
+
+        if self.ALLOW_GUEST_CHAT is None:
+            self.ALLOW_GUEST_CHAT = env == "local"
+
+        # Explicit safeguard: guest chat can only be enabled in local mode.
+        if env != "local":
+            self.ALLOW_GUEST_CHAT = False
+
+        if env in {"production", "prod"}:
             missing = [
                 name
                 for name in (

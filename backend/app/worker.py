@@ -54,6 +54,8 @@ _PIPELINE_SEMAPHORE = asyncio.Semaphore(_MAX_CONCURRENT_PIPELINES)
 _RATE_LIMIT_MAX_RETRIES: int = 3
 _RATE_LIMIT_BASE_DELAY: float = 2.0   # seconds; doubled each attempt
 _RATE_LIMIT_MAX_DELAY: float = 30.0   # cap
+_REDIS_DISCONNECT_LOG_THRESHOLD: int = 5
+_REDIS_DISCONNECT_LOG_EVERY: int = 10
 
 
 def _is_rate_limit_error(exc: Exception) -> bool:
@@ -190,14 +192,19 @@ class JobWorker:
             except ConnectionError:
                 consecutive_failures += 1
                 delay = min(2 ** consecutive_failures, 60)
-                logger.warning(
-                    "worker_redis_disconnect",
-                    extra={
-                        "event": "worker_redis_disconnect",
-                        "consecutive_failures": consecutive_failures,
-                        "backoff_seconds": delay,
-                    },
+                should_log_disconnect = (
+                    consecutive_failures <= _REDIS_DISCONNECT_LOG_THRESHOLD
+                    or consecutive_failures % _REDIS_DISCONNECT_LOG_EVERY == 0
                 )
+                if should_log_disconnect:
+                    logger.warning(
+                        "worker_redis_disconnect",
+                        extra={
+                            "event": "worker_redis_disconnect",
+                            "consecutive_failures": consecutive_failures,
+                            "backoff_seconds": delay,
+                        },
+                    )
                 from app.core.queue import reset_redis_state
 
                 await reset_redis_state()
@@ -373,6 +380,9 @@ class JobWorker:
                 )
                 return
 
+            if snapshot.status == "done":
+                return
+
             # Terminal guard — never reprocess finished jobs
             if snapshot.status in _TERMINAL:
                 logger.info(
@@ -510,12 +520,29 @@ class JobWorker:
                 await self._finalize_success(
                     job_id, result_data, started_at_perf=started_at, run_id=run_id
                 )
+                return
 
             except asyncio.TimeoutError:
                 try:
                     await db.rollback()
                 except Exception:
                     pass
+
+                # Timeout race hardening: if another path already persisted result,
+                # finalize as success instead of forcing failure/retry.
+                try:
+                    await db.refresh(job)
+                except Exception:
+                    pass
+                if job.result is not None:
+                    await self._finalize_success(
+                        job.id,
+                        job.result,
+                        started_at_perf=started_at,
+                        run_id=run_id,
+                    )
+                    return
+
                 await self._finalize_failure(job_id, "Job timed out", run_id=run_id)
 
             except Exception as exc:
@@ -534,45 +561,10 @@ class JobWorker:
             if job is None:
                 return
 
-            status_before = job.status
-
-            # Never retry / mark failed once success is persisted (or already terminal).
             if job.status == "done" or job.result is not None:
-                if job.result is not None and job.status != "done":
-                    job.status = "done"
-                    job.error = None
-                    if job.completed_at is None:
-                        job.completed_at = datetime.utcnow()
-                    await db.commit()
-                    try:
-                        logger.warning(
-                            "job_recovered_result_on_failure_path",
-                            extra={
-                                "event": "job_recovered_result_on_failure_path",
-                                "job_id": job_id,
-                                "run_id": run_id,
-                                "status_before": status_before,
-                                "status_after": "done",
-                            },
-                        )
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        logger.info(
-                            "job_skipped",
-                            extra={
-                                "event": "job_skipped",
-                                "job_id": job_id,
-                                "run_id": run_id,
-                                "reason": "failure_after_done_or_has_result",
-                                "status_before": status_before,
-                                "status_after": job.status,
-                            },
-                        )
-                    except Exception:
-                        pass
                 return
+
+            status_before = job.status
 
             if job.status not in ("running", "pending"):
                 logger.info(
@@ -787,6 +779,25 @@ class JobWorker:
         )
 
         if will_retry:
+            # ---------------------------------------------------------
+            # SAFETY GUARD — DO NOT RETRY SUCCESSFUL JOBS
+            # ---------------------------------------------------------
+            if job.status == "done" or job.result is not None:
+                try:
+                    logger.info(
+                        "job_retry_skipped_already_completed",
+                        extra={
+                            "event": "job_retry_skipped_already_completed",
+                            "job_id": job.id,
+                            "status": job.status,
+                            "has_result": job.result is not None,
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+            # ---------------------------------------------------------
+
             # GAP 10 — Retry delay hint for the frontend: mirrors the backoff the
             # worker will apply before re-executing, so the client waits the right amount.
             retry_delay_s = min(2 ** job.attempts, 30) + random.uniform(0, 1)

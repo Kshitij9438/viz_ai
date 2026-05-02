@@ -13,10 +13,12 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import IdentityContext, get_current_or_guest_user
+from app.core.auth import IdentityContext
+from app.core.config import settings
 from app.core.db import get_session
 from app.core.limiter import limiter
 from app.models.models import Job
+from app.routers.chat import resolve_user
 from app.services.storage import public_asset_url
 
 router = APIRouter(prefix="/api/v1", tags=["jobs"])
@@ -71,7 +73,7 @@ def _normalize_job_result(result: dict[str, Any] | None) -> dict[str, Any] | Non
 async def get_job_status(
     request: Request,
     job_id: str,
-    identity: IdentityContext = Depends(get_current_or_guest_user),
+    identity: IdentityContext = Depends(resolve_user),
     db: AsyncSession = Depends(get_session),
 ) -> JobStatusResponse:
     """Poll for job result.
@@ -91,7 +93,8 @@ async def get_job_status(
 
     # Auth: only the job creator can view it
     if job.user_id != identity.user.id:
-        raise HTTPException(status_code=403, detail="Forbidden")
+        if not settings.ALLOW_GUEST_CHAT:
+            raise HTTPException(status_code=403, detail="Forbidden")
 
     # Determine retry_after hint
     retry_after = None

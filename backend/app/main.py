@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi.errors import RateLimitExceeded
 
 from app.core.config import settings
@@ -113,6 +115,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Vizzy AI", version="0.2.0", lifespan=lifespan)
+if os.path.exists(settings.STORAGE_DIR):
+    app.mount(
+        "/storage",
+        StaticFiles(directory=settings.STORAGE_DIR),
+        name="storage",
+    )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
 app.middleware("http")(request_logging_middleware)

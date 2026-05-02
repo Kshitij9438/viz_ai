@@ -3,12 +3,20 @@
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import IdentityContext, get_current_or_guest_user
+from app.core.auth import (
+    IdentityContext,
+    bearer_scheme,
+    create_guest_token,
+    get_current_or_guest_user,
+    get_optional_user,
+)
+from app.core.config import settings
 from app.core.db import AsyncSessionLocal, get_session
 from app.core.limiter import limiter
 from app.core.queue import check_dedup, enqueue_job, set_dedup
@@ -31,6 +39,50 @@ from app.services.intent_engine import classify_intent
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 _chat_log = logging.getLogger("vizzy.chat")
+
+
+async def resolve_user(
+    request: Request,
+    access_credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    x_guest_token: str | None = Header(default=None, alias="X-Guest-Token"),
+    db: AsyncSession = Depends(get_session),
+) -> IdentityContext:
+    """
+    Safe user resolution:
+    - Production -> requires auth
+    - Local/dev -> allows guest
+    """
+    # 1) Try authenticated access token first.
+    try:
+        user = await get_optional_user(access_credentials, db)
+        if user is not None:
+            request.state.user = user
+            return IdentityContext(user=user, is_guest=False, guest_token=None)
+    except Exception:
+        # Invalid/malformed auth should not block local guest fallback.
+        pass
+
+    # 2) Try explicit guest token if provided.
+    if x_guest_token:
+        try:
+            return await get_current_or_guest_user(request, access_credentials, x_guest_token, db)
+        except Exception:
+            # If guest auth fails and local guest is disabled, enforce auth.
+            if not settings.ALLOW_GUEST_CHAT:
+                raise HTTPException(status_code=401, detail="Authentication required")
+
+    # 3) If guest fallback is disabled, require authentication.
+    if not settings.ALLOW_GUEST_CHAT:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # 4) Local/dev fallback: provision a guest identity.
+    guest_user = User(account_type="home")
+    db.add(guest_user)
+    await db.commit()
+    await db.refresh(guest_user)
+    guest_token = create_guest_token(guest_user.id)
+    request.state.user = guest_user
+    return IdentityContext(user=guest_user, is_guest=True, guest_token=guest_token)
 
 
 class Attachment(BaseModel):
@@ -142,7 +194,7 @@ _GENERATION_INTENTS = {"image", "story", "video", "moodboard", "campaign", "edit
 async def chat(
     request: Request,
     req: ChatRequest,
-    identity: IdentityContext = Depends(get_current_or_guest_user),
+    identity: IdentityContext = Depends(resolve_user),
     db: AsyncSession = Depends(get_session),
 ) -> ChatResponse:
     user = identity.user
@@ -327,20 +379,27 @@ async def chat(
     await db.commit()
     await db.refresh(job)
 
-    # Enqueue to Redis (transport only)
-    enqueued = await enqueue_job(job.id)
+    # Enqueue to Redis (transport only) with inline fallback if unavailable.
+    try:
+        enqueued = await enqueue_job(job.id)
+        if not enqueued:
+            raise RuntimeError("enqueue_job returned false")
+    except Exception as e:
+        import logging
+        logger = logging.getLogger("vizzy.chat")
 
-    if not enqueued:
-        # Redis unavailable — return degraded response, do NOT run pipeline sync
-        return ChatResponse(
-            reply="I understood your request, but image generation is temporarily unavailable. Please try again in a moment.",
-            job_id=None,
-            job_status=None,
-            session_id=session.id,
-            user_id=user.id,
-            guest_token=identity.guest_token,
-            intent=intent.model_dump(),
+        logger.warning(
+            "redis_unavailable_fallback_to_inline",
+            extra={
+                "event": "redis_unavailable_fallback_to_inline",
+                "job_id": job.id,
+                "error": str(e)[:200],
+            },
         )
+
+        from app.worker import JobWorker
+        worker = JobWorker()
+        await worker._process_job(job.id)
 
     # Set dedup marker
     await set_dedup(user.id, session.id, job_user_message, job.id)
