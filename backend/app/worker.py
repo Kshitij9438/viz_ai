@@ -147,6 +147,33 @@ class JobWorker:
                         )
                         continue
 
+                    recovered = await self._recover_result_from_committed_message(job)
+                    if recovered is not None:
+                        status_before = job.status
+                        recovered.setdefault("_meta", {})
+                        recovered["_meta"].update({
+                            "run_id": "startup_recovery",
+                            "poll_after_ms": 0,
+                            "completed_at": datetime.utcnow().isoformat(),
+                        })
+                        job.status = "done"
+                        job.result = recovered
+                        job.error = None
+                        if job.completed_at is None:
+                            job.completed_at = datetime.utcnow()
+                        await db.commit()
+                        logger.info(
+                            "job_reconciled",
+                            extra={
+                                "event": "job_reconciled",
+                                "job_id": job.id,
+                                "status_before": status_before,
+                                "status_after": "done",
+                                "has_result": True,
+                            },
+                        )
+                        continue
+
                     # Reset running jobs back to pending for re-claim
                     if job.status == "running":
                         status_before = job.status
@@ -319,6 +346,11 @@ class JobWorker:
 
                 # Guard against double-finalization in race conditions.
                 if job.result is not None:
+                    if job.status != "done":
+                        job.status = "done"
+                        job.completed_at = job.completed_at or datetime.utcnow()
+                        job.error = None
+                        await db.commit()
                     return
 
                 # GAP 2/10 — Embed frontend polling hint and run identity in result metadata.
@@ -566,6 +598,16 @@ class JobWorker:
                     )
                     return
 
+                recovered = await self._recover_result_from_committed_message(job)
+                if recovered is not None:
+                    await self._finalize_success(
+                        job.id,
+                        recovered,
+                        started_at_perf=started_at,
+                        run_id=run_id,
+                    )
+                    return
+
                 await self._finalize_failure(job_id, "Job timed out", run_id=run_id)
 
             except Exception as exc:
@@ -573,7 +615,101 @@ class JobWorker:
                     await db.rollback()
                 except Exception:
                     pass
+                recovered = await self._recover_result_from_committed_message(job)
+                if recovered is not None:
+                    await self._finalize_success(
+                        job.id,
+                        recovered,
+                        started_at_perf=started_at,
+                        run_id=run_id,
+                    )
+                    return
                 await self._finalize_failure(job_id, str(exc), run_id=run_id)
+
+    async def _recover_result_from_committed_message(self, job: Job) -> dict[str, Any] | None:
+        """Recover a completed job when timeout lands after durable message commit."""
+        from app.models.models import Asset, Message
+
+        async with AsyncSessionLocal() as db:
+            message = (
+                await db.execute(
+                    select(Message)
+                    .where(
+                        Message.session_id == job.session_id,
+                        Message.role == "assistant",
+                        Message.asset_bundle_id.is_not(None),
+                    )
+                    .order_by(Message.created_at.desc(), Message.sequence.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+            if message is None or not message.asset_bundle_id:
+                return None
+
+            if job.started_at and message.created_at and message.created_at < job.started_at:
+                return None
+
+            assets = (
+                await db.execute(
+                    select(Asset)
+                    .where(Asset.bundle_id == message.asset_bundle_id)
+                    .order_by(Asset.variant_index.asc(), Asset.created_at.asc())
+                )
+            ).scalars().all()
+
+            if not assets:
+                return None
+
+            tool_calls = message.tool_calls or {}
+            creative_output = tool_calls.get("creative_output")
+            intent = tool_calls.get("intent")
+
+            bundle: dict[str, Any] | None = None
+            if isinstance(creative_output, dict):
+                for item in creative_output.get("outputs") or []:
+                    if isinstance(item, dict) and item.get("kind") == "asset_bundle":
+                        candidate = item.get("bundle")
+                        if isinstance(candidate, dict):
+                            bundle = dict(candidate)
+                            break
+
+            if bundle is None:
+                bundle = {
+                    "bundle_id": message.asset_bundle_id,
+                    "type": assets[0].type,
+                    "prompt_used": assets[0].prompt,
+                    "actions": ["select", "download_all", "refine", "share", "save"],
+                }
+
+            bundle["assets"] = [
+                {
+                    "id": asset.id,
+                    "url": public_asset_url(asset.url),
+                    "index": asset.variant_index,
+                    "type": asset.type,
+                }
+                for asset in assets
+            ]
+
+            logger.warning(
+                "job_result_recovered_from_message",
+                extra={
+                    "event": "job_result_recovered_from_message",
+                    "job_id": job.id,
+                    "status_before": job.status,
+                    "status_after": "done",
+                    "has_result": True,
+                },
+            )
+
+            return {
+                "reply": message.content,
+                "asset_bundle": bundle,
+                "creative_output": creative_output,
+                "intent": intent,
+                "tool_call": {"name": "pipeline", "arguments": intent} if intent else None,
+            }
 
     async def _finalize_failure(self, job_id: str, error_msg: str, *, run_id: str) -> None:
         """Handle failure using a fresh DB session; never overwrite 'done' or valid result."""

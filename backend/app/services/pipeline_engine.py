@@ -79,8 +79,8 @@ class ImagePipeline(BasePipeline):
 
     async def run(self, ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
         prompt = self._personalized_prompt(ctx, ctx.message)
-        raw_count = int(intent.parameters.get("count") or 3)
-        count = max(raw_count, 3)
+        raw_count = int(intent.parameters.get("count") or 1)
+        count = max(1, min(raw_count, 3))
         params = GenerateParams(
             output_type="image",
             prompt=prompt,
