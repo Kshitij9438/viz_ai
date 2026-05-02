@@ -174,6 +174,20 @@ class JobWorker:
                         )
                         continue
 
+                    await db.refresh(job)
+                    if job.status == "done" or job.result is not None:
+                        logger.info(
+                            "retry_blocked_already_completed",
+                            extra={
+                                "event": "retry_blocked_already_completed",
+                                "job_id": job.id,
+                                "status": job.status,
+                                "has_result": job.result is not None,
+                                "source": "orphan_recovery_enqueue",
+                            },
+                        )
+                        continue
+
                     # Reset running jobs back to pending for re-claim
                     if job.status == "running":
                         status_before = job.status
@@ -181,6 +195,20 @@ class JobWorker:
                         await db.commit()
                     else:
                         status_before = job.status
+
+                    await db.refresh(job)
+                    if job.status == "done" or job.result is not None:
+                        logger.info(
+                            "retry_blocked_already_completed",
+                            extra={
+                                "event": "retry_blocked_already_completed",
+                                "job_id": job.id,
+                                "status": job.status,
+                                "has_result": job.result is not None,
+                                "source": "orphan_recovery_pre_enqueue",
+                            },
+                        )
+                        continue
 
                     enqueued = await enqueue_job(job.id)
                     logger.info(
@@ -367,6 +395,7 @@ class JobWorker:
                 job.completed_at = datetime.utcnow()
                 job.error = None
                 await db.commit()
+                await db.refresh(job)
                 logger.info(
                     "job_success_marker_v1",
                     extra={"job_id": job_id},
@@ -435,7 +464,23 @@ class JobWorker:
                 )
                 return
 
-            if snapshot.status == "done":
+            if snapshot.status == "done" or snapshot.result is not None:
+                logger.info(
+                    "skip_already_completed_job",
+                    extra={
+                        "event": "skip_already_completed_job",
+                        "job_id": job_id,
+                        "run_id": run_id,
+                        "reason": "already_completed_at_fetch",
+                        "status_before": snapshot.status,
+                        "has_result": snapshot.result is not None,
+                    },
+                )
+                if snapshot.status != "done" and snapshot.result is not None:
+                    snapshot.status = "done"
+                    if snapshot.completed_at is None:
+                        snapshot.completed_at = datetime.utcnow()
+                    await db.commit()
                 return
 
             # Terminal guard — never reprocess finished jobs
@@ -453,23 +498,19 @@ class JobWorker:
                 )
                 return
 
-            if snapshot.result is not None and snapshot.status in ("pending", "running"):
-                # Inconsistent row: reconcile to done on the fly
+            if snapshot.status == "running" and snapshot.attempts > 0:
                 logger.info(
-                    "job_skipped",
+                    "job_claim_skipped",
                     extra={
-                        "event": "job_skipped",
+                        "event": "job_claim_skipped",
                         "job_id": job_id,
                         "run_id": run_id,
-                        "reason": "has_result_reconcile",
                         "status_before": snapshot.status,
-                        "status_after": "done",
+                        "status_after": snapshot.status,
+                        "reason": "already_running_attempted",
+                        "attempt": snapshot.attempts,
                     },
                 )
-                snapshot.status = "done"
-                if snapshot.completed_at is None:
-                    snapshot.completed_at = datetime.utcnow()
-                await db.commit()
                 return
 
             # ---- ATOMIC CLAIM ----
@@ -510,6 +551,20 @@ class JobWorker:
             # read where another worker could have claimed or completed the job.
             # Only proceed if we genuinely own a 'running' row right now.
             await db.refresh(job)
+            if job.status == "done" or job.result is not None:
+                logger.info(
+                    "skip_already_completed_job",
+                    extra={
+                        "event": "skip_already_completed_job",
+                        "job_id": job_id,
+                        "run_id": run_id,
+                        "reason": "already_completed_after_claim",
+                        "status_before": job.status,
+                        "has_result": job.result is not None,
+                    },
+                )
+                return
+
             if job.status != "running":
                 logger.info(
                     "job_execution_barrier_rejected",
@@ -721,6 +776,17 @@ class JobWorker:
                 return
 
             if job.status == "done" or job.result is not None:
+                logger.info(
+                    "retry_blocked_already_completed",
+                    extra={
+                        "event": "retry_blocked_already_completed",
+                        "job_id": job_id,
+                        "run_id": run_id,
+                        "status": job.status,
+                        "has_result": job.result is not None,
+                        "source": "finalize_failure",
+                    },
+                )
                 return
 
             status_before = job.status
@@ -767,38 +833,17 @@ class JobWorker:
                     # Non-rate-limit errors propagate immediately.
                     raise
 
-                last_exc = exc
-
-                if attempt >= _RATE_LIMIT_MAX_RETRIES:
-                    logger.error(
-                        "pipeline_rate_limit_retries_exhausted",
-                        extra={
-                            "event": "pipeline_rate_limit_retries_exhausted",
-                            "job_id": job.id,
-                            "run_id": run_id,
-                            "attempt": attempt,
-                            "error": str(exc)[:300],
-                        },
-                    )
-                    raise
-
-                # Exponential backoff with full jitter.
-                raw_delay = min(_RATE_LIMIT_BASE_DELAY * (2 ** attempt), _RATE_LIMIT_MAX_DELAY)
-                delay = raw_delay + random.uniform(0, 1)
-
-                logger.warning(
-                    "pipeline_rate_limit_retry",
+                logger.error(
+                    "pipeline_rate_limit_retries_exhausted",
                     extra={
-                        "event": "pipeline_rate_limit_retry",
+                        "event": "pipeline_rate_limit_retries_exhausted",
                         "job_id": job.id,
                         "run_id": run_id,
-                        "attempt": attempt + 1,
-                        "max_retries": _RATE_LIMIT_MAX_RETRIES,
-                        "retry_delay_ms": round(delay * 1000, 1),
+                        "attempt": attempt,
                         "error": str(exc)[:300],
                     },
                 )
-                await asyncio.sleep(delay)
+                raise
 
         # Unreachable — loop always raises or returns, but satisfies type checkers.
         raise last_exc  # type: ignore[misc]
@@ -931,11 +976,23 @@ class JobWorker:
 
         # Absolute guard — covers both job.status == "done" and job.result is not None.
         if job.status == "done" or job.result is not None:
+            logger.info(
+                "retry_blocked_already_completed",
+                extra={
+                    "event": "retry_blocked_already_completed",
+                    "job_id": job.id,
+                    "run_id": run_id,
+                    "status": job.status,
+                    "has_result": job.result is not None,
+                    "source": "handle_failure_entry",
+                },
+            )
             return
 
         will_retry = (
             job.status != "done"
             and job.result is None
+            and not _is_rate_limit_error(RuntimeError(error_msg))
             and job.attempts < settings.QUEUE_MAX_TRIES
         )
 
@@ -964,6 +1021,21 @@ class JobWorker:
             retry_delay_s = min(2 ** job.attempts, 30) + random.uniform(0, 1)
             poll_after_ms = round(retry_delay_s * 1000)
 
+            await db.refresh(job)
+            if job.status == "done" or job.result is not None:
+                logger.info(
+                    "retry_blocked_already_completed",
+                    extra={
+                        "event": "retry_blocked_already_completed",
+                        "job_id": job.id,
+                        "run_id": run_id,
+                        "status": job.status,
+                        "has_result": job.result is not None,
+                        "source": "pre_retry_status_update",
+                    },
+                )
+                return
+
             job.status = "pending"
             job.error = error_msg
             await db.commit()
@@ -972,6 +1044,17 @@ class JobWorker:
             # any concurrent success commit from another worker/session.
             await db.refresh(job)
             if job.status == "done" or job.result is not None:
+                logger.info(
+                    "retry_blocked_already_completed",
+                    extra={
+                        "event": "retry_blocked_already_completed",
+                        "job_id": job.id,
+                        "run_id": run_id,
+                        "status": job.status,
+                        "has_result": job.result is not None,
+                        "source": "pre_retry_enqueue",
+                    },
+                )
                 return
 
             await enqueue_job(job.id)

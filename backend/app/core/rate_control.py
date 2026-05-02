@@ -114,6 +114,20 @@ async def retry_with_backoff(
                 if operation_name == "image_call":
                     _record_429()
 
+                attempts = attempt + 1
+                if operation_name == "image_call" and attempts >= 3:
+                    logger.error(
+                        "image_request_429",
+                        extra={
+                            "event": "image_request_429",
+                            "attempt": attempts,
+                            "delay_seconds": 0,
+                            "consecutive_429s": _consecutive_429s,
+                            "reason": "max_429_attempts_reached",
+                        },
+                    )
+                    raise
+
                 retry_after = exc.response.headers.get("Retry-After")
                 if retry_after:
                     try:
@@ -123,14 +137,25 @@ async def retry_with_backoff(
                 else:
                     # No Retry-After header — use generous delay
                     sleep_time = max(sleep_time, 2.0 + random.uniform(0.5, 2.0))
+                sleep_time = min(2 ** attempts, 30)
 
                 logger.warning(
                     "image_request_429",
                     extra={
                         "event": "image_request_429",
-                        "attempt": attempt + 1,
+                        "attempt": attempts,
                         "delay_seconds": round(sleep_time, 2),
                         "consecutive_429s": _consecutive_429s,
+                    },
+                )
+                logger.warning(
+                    "429_backoff_triggered",
+                    extra={
+                        "event": "429_backoff_triggered",
+                        "target": operation_name,
+                        "attempt": attempts,
+                        "max_retries": max_retries,
+                        "delay_seconds": round(sleep_time, 2),
                     },
                 )
 

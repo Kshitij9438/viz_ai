@@ -17,13 +17,13 @@ class JsonFormatter(logging.Formatter):
         "request_id", "method", "path", "status_code", "duration_ms",
         "event", "error",
         # Job lifecycle
-        "job_id", "attempt", "will_retry", "type",
+        "job_id", "attempt", "will_retry", "type", "source",
         "original_status", "re_enqueued",
         "status", "status_before", "status_after", "has_result",
         # Queue & backpressure
         "queue_depth", "max_depth", "operation",
         # Rate control
-        "target", "max_retries", "delay_seconds", "reason",
+        "target", "max_retries", "delay_seconds", "reason", "consecutive_429s",
         # Worker
         "consecutive_failures", "backoff_seconds",
         "restart_count", "restarts_in_window", "window_seconds",

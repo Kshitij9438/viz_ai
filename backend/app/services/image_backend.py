@@ -118,6 +118,18 @@ class PollinationsBackend:
                 extra={"event": "image_success", "prompt_len": len(prompt)},
             )
             return result
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                logger.error(
+                    "image_generation_rate_limited",
+                    extra={
+                        "event": "image_generation_rate_limited",
+                        "error": str(exc)[:300],
+                        "prompt_len": len(prompt),
+                    },
+                )
+                raise
+            raise
         except Exception as exc:
             logger.error(
                 "image_fallback_used",

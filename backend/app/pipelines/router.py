@@ -6,7 +6,6 @@ calling ``run_generation``.
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import io
 import time
@@ -59,17 +58,15 @@ async def _gen_one(
 
 
 async def _gen_many(prompt: str, n: int, *, seed: int | None = None, **kw: Any) -> list[bytes]:
-    """Generate n images with bounded concurrency (Semaphore(2)).
-
-    Each call goes through the image semaphore in generate_safe(),
-    so at most 2 image API requests are in-flight at once.
-    This prevents Pollinations 429 spam while still allowing parallelism.
-    """
+    """Generate n images sequentially so a first 429 stops additional seeds."""
     async def one(i: int) -> bytes:
         s = None if seed is None else _seed_variant(seed, i)
         return await _gen_one(prompt, seed=s, **kw)
 
-    return await asyncio.gather(*[one(i) for i in range(n)])
+    images: list[bytes] = []
+    for i in range(n):
+        images.append(await one(i))
+    return images
 
 
 # ---------- compositing helpers ----------
