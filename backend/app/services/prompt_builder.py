@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import random
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from app.models.models import BusinessProfile, UserTasteProfile
 
@@ -240,18 +240,35 @@ def build_image_prompt(
     style_tags: list[str] | None = None,
     taste: UserTasteProfile | None = None,
     business: BusinessProfile | None = None,
+    design_context: dict[str, Any] | None = None,
 ) -> str:
     """Build prompt: user intent first; taste/brand as short Style: keywords only.
 
     Total length capped at MAX_PROMPT_LENGTH by trimming the style segment only,
     never the user intent.
     """
-    # Defensive: strip accidental "Style:" prefix leaking into user intent.
-    intent = (base_prompt or "").strip().rstrip(".")
-    if intent.lower().startswith("style:"):
-        intent = re.sub(r"^style:\s*", "", intent, flags=re.IGNORECASE).strip()
-    if not intent:
-        intent = _DEFAULT_INTENT
+    if design_context and any(design_context.get(k) for k in ("subject", "style", "colors", "mood")):
+        subject = str(design_context.get("subject") or "visual design").strip()
+        style = str(design_context.get("style") or "refined").strip()
+        colors = str(design_context.get("colors") or "balanced palette").strip()
+        mood = str(design_context.get("mood") or "polished").strip()
+        final = f"{subject}. Style: {style}. Colors: {colors}. Mood: {mood}"[:MAX_PROMPT_LENGTH]
+        logger.info(
+            "final_image_prompt",
+            extra={
+                "event": "final_image_prompt",
+                "prompt": final,
+                "prompt_length": len(final),
+            },
+        )
+        return final
+    else:
+        # Defensive: strip accidental "Style:" prefix leaking into user intent.
+        intent = (base_prompt or "").strip().rstrip(".")
+        if intent.lower().startswith("style:"):
+            intent = re.sub(r"^style:\s*", "", intent, flags=re.IGNORECASE).strip()
+        if not intent:
+            intent = _DEFAULT_INTENT
 
     style_pieces: list[str] = []
     if style_tags:

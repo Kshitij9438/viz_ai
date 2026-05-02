@@ -35,7 +35,7 @@ from sqlalchemy import select, update
 
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
-from app.core.queue import dequeue_job, enqueue_job
+from app.core.queue import dequeue_job, enqueue_job, get_redis
 from app.models.models import Job
 from app.services.storage import public_asset_url
 
@@ -442,6 +442,68 @@ class JobWorker:
         except Exception:
             pass
 
+    async def _update_progress(
+        self,
+        db,
+        job: Job,
+        stage: str,
+        percent: int,
+        *,
+        message: str,
+        run_id: str,
+    ) -> None:
+        """Persist lightweight progress without changing the polling API shape."""
+        job.progress = {
+            "stage": stage,
+            "percent": percent,
+            "message": message,
+            "updated_at": datetime.utcnow().isoformat(),
+        }
+        await db.commit()
+        logger.info(
+            "job_progress_updated",
+            extra={
+                "event": "job_progress_updated",
+                "job_id": job.id,
+                "run_id": run_id,
+                "status": job.status,
+                "stage": stage,
+                "percent": percent,
+            },
+        )
+
+    async def _acquire_execution_lock(self, job_id: str, run_id: str) -> str | None:
+        lock_key = f"job_lock:{job_id}"
+        redis = await get_redis()
+        if redis is None:
+            logger.warning(
+                "execution_lock_unavailable",
+                extra={"event": "execution_lock_unavailable", "job_id": job_id, "run_id": run_id},
+            )
+            return None
+
+        acquired = await redis.set(lock_key, "1", nx=True, ex=300)
+        if not acquired:
+            logger.info(
+                "execution_skipped_locked",
+                extra={"event": "execution_skipped_locked", "job_id": job_id, "run_id": run_id},
+            )
+            return None
+        return lock_key
+
+    async def _release_execution_lock(self, lock_key: str | None) -> None:
+        if lock_key is None:
+            return
+        try:
+            redis = await get_redis()
+            if redis is not None:
+                await redis.delete(lock_key)
+        except Exception as exc:
+            logger.warning(
+                "execution_lock_release_failed",
+                extra={"event": "execution_lock_release_failed", "error": str(exc)[:200]},
+            )
+
     async def _process_job(self, job_id: str) -> None:
         """Execute a single job with atomic claim and timeout.
 
@@ -500,9 +562,9 @@ class JobWorker:
 
             if snapshot.status == "running" and snapshot.attempts > 0:
                 logger.info(
-                    "job_claim_skipped",
+                    "duplicate_execution_blocked",
                     extra={
-                        "event": "job_claim_skipped",
+                        "event": "duplicate_execution_blocked",
                         "job_id": job_id,
                         "run_id": run_id,
                         "status_before": snapshot.status,
@@ -511,6 +573,10 @@ class JobWorker:
                         "attempt": snapshot.attempts,
                     },
                 )
+                return
+
+            lock_key = await self._acquire_execution_lock(job_id, run_id)
+            if lock_key is None:
                 return
 
             # ---- ATOMIC CLAIM ----
@@ -541,6 +607,7 @@ class JobWorker:
                         "status_after": lost or "unknown",
                     },
                 )
+                await self._release_execution_lock(lock_key)
                 return
 
             job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one()
@@ -563,6 +630,7 @@ class JobWorker:
                         "has_result": job.result is not None,
                     },
                 )
+                await self._release_execution_lock(lock_key)
                 return
 
             if job.status != "running":
@@ -576,6 +644,7 @@ class JobWorker:
                         "reason": "status_changed_between_claim_and_execute",
                     },
                 )
+                await self._release_execution_lock(lock_key)
                 return
 
             logger.info(
@@ -601,10 +670,26 @@ class JobWorker:
                     "type": job.type,
                 },
             )
+            await self._update_progress(
+                db,
+                job,
+                "starting",
+                10,
+                message="Generating your design...",
+                run_id=run_id,
+            )
 
             try:
                 # GAP 7 — Semaphore caps concurrent pipeline executions per replica,
                 # preventing this worker from flooding the image provider.
+                await self._update_progress(
+                    db,
+                    job,
+                    "generating",
+                    60,
+                    message="Still working...",
+                    run_id=run_id,
+                )
                 async with _PIPELINE_SEMAPHORE:
                     result_data = await asyncio.wait_for(
                         # GAP 3 — Rate-limit-aware wrapper with backoff + jitter.
@@ -616,6 +701,14 @@ class JobWorker:
                 if not self._pipeline_result_is_valid(result_data):
                     # SAFETY: bundle exists → success regardless of other fields
                     if isinstance(result_data, dict) and result_data.get("asset_bundle") is not None:
+                        await self._update_progress(
+                            db,
+                            job,
+                            "finalizing",
+                            90,
+                            message="Here's your design. Want to refine?",
+                            run_id=run_id,
+                        )
                         await self._finalize_success(
                             job_id, result_data, started_at_perf=started_at, run_id=run_id
                         )
@@ -627,6 +720,14 @@ class JobWorker:
                     return
 
                 # Normal success path
+                await self._update_progress(
+                    db,
+                    job,
+                    "finalizing",
+                    90,
+                    message="Here's your design. Want to refine?",
+                    run_id=run_id,
+                )
                 await self._finalize_success(
                     job_id, result_data, started_at_perf=started_at, run_id=run_id
                 )
@@ -680,6 +781,8 @@ class JobWorker:
                     )
                     return
                 await self._finalize_failure(job_id, str(exc), run_id=run_id)
+            finally:
+                await self._release_execution_lock(lock_key)
 
     async def _recover_result_from_committed_message(self, job: Job) -> dict[str, Any] | None:
         """Recover a completed job when timeout lands after durable message commit."""
@@ -913,6 +1016,7 @@ class JobWorker:
             taste=taste,
             business=business,
             session_last_prompt=session.last_prompt,
+            design_context=intent_data.get("design_context"),
         )
 
         pipeline_result = await execute_pipeline(ctx, intent)
@@ -993,7 +1097,7 @@ class JobWorker:
             job.status != "done"
             and job.result is None
             and not _is_rate_limit_error(RuntimeError(error_msg))
-            and job.attempts < settings.QUEUE_MAX_TRIES
+            and job.attempts < 3
         )
 
         if will_retry:
@@ -1018,11 +1122,20 @@ class JobWorker:
 
             # GAP 10 — Retry delay hint for the frontend: mirrors the backoff the
             # worker will apply before re-executing, so the client waits the right amount.
-            retry_delay_s = min(2 ** job.attempts, 30) + random.uniform(0, 1)
+            retry_delay_s = min(2 ** job.attempts, 30)
             poll_after_ms = round(retry_delay_s * 1000)
 
-            await db.refresh(job)
-            if job.status == "done" or job.result is not None:
+            retry_update = await db.execute(
+                update(Job)
+                .where(
+                    Job.id == job.id,
+                    Job.status.not_in(["done", "failed"]),
+                    Job.result.is_(None),
+                )
+                .values(status="pending", error=error_msg)
+            )
+            if retry_update.rowcount == 0:
+                await db.rollback()
                 logger.info(
                     "retry_blocked_already_completed",
                     extra={
@@ -1031,13 +1144,10 @@ class JobWorker:
                         "run_id": run_id,
                         "status": job.status,
                         "has_result": job.result is not None,
-                        "source": "pre_retry_status_update",
+                        "source": "atomic_retry_update",
                     },
                 )
                 return
-
-            job.status = "pending"
-            job.error = error_msg
             await db.commit()
 
             # ABSOLUTE FINAL GUARD — re-read DB state before enqueue to catch

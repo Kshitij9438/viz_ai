@@ -149,6 +149,7 @@ class Job(Base):
     status: Mapped[str] = mapped_column(String, default="pending", index=True)
     result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    progress: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

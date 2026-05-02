@@ -19,7 +19,7 @@ class JsonFormatter(logging.Formatter):
         # Job lifecycle
         "job_id", "attempt", "will_retry", "type", "source",
         "original_status", "re_enqueued",
-        "status", "status_before", "status_after", "has_result",
+        "status", "status_before", "status_after", "has_result", "stage", "percent",
         # Queue & backpressure
         "queue_depth", "max_depth", "operation",
         # Rate control

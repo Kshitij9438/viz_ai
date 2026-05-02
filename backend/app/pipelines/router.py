@@ -155,6 +155,7 @@ async def run_generation(
     session_id: str,
     taste: UserTasteProfile | None,
     business: BusinessProfile | None,
+    design_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Routes generate() params to the correct pipeline and returns an AssetBundle dict."""
     bundle_id = f"bnd_{uuid.uuid4().hex[:12]}"
@@ -176,7 +177,11 @@ async def run_generation(
     await db.commit()
 
     enriched = build_image_prompt(
-        params.prompt, style_tags=params.style_tags, taste=taste, business=business
+        params.prompt,
+        style_tags=params.style_tags,
+        taste=taste,
+        business=business,
+        design_context=design_context,
     )
     negative = build_negative_prompt(params.negative_prompt, taste=taste)
     base_seed = _generation_base_seed(user_id, params.prompt)
@@ -187,10 +192,10 @@ async def run_generation(
 
     # ---- routing ----
     if params.output_type in ("image", "style_transfer"):
-        n = max(1, min(params.count or 3, 9))
+        num_images = 1
         imgs = await _gen_many(
             enriched,
-            n,
+            num_images,
             seed=base_seed,
             negative_prompt=negative,
             width=width,
@@ -255,16 +260,16 @@ async def run_generation(
         bundle_type = "story_sequence"
 
     elif params.output_type == "vision_board":
-        n = params.count if params.count in (4, 6, 9) else 6
+        num_images = 1
         imgs = await _gen_many(
             enriched,
-            n,
+            num_images,
             seed=base_seed,
             negative_prompt=negative,
             width=width,
             height=height,
         )
-        composed = _grid(imgs, cols=3 if n == 9 else (3 if n == 6 else 2))
+        composed = _grid(imgs, cols=1)
         _, board_url = storage.save_bytes(composed, ".jpg")
         asset_records.append(Asset(
             user_id=user_id, session_id=session_id, bundle_id=bundle_id,

@@ -242,7 +242,7 @@ export default function Page() {
               ...current,
               {
                 role: "assistant" as const,
-                content: res.reply,
+                content: "Generating your design...",
                 bundle: null as AssetBundle | null | undefined,
                 creative_output: null as ChatMessage["creative_output"],
               },
@@ -286,7 +286,7 @@ export default function Page() {
                   const replyText = result?.reply ?? res.reply;
                   applyJobToAssistant((existing) => ({
                     ...existing,
-                    content: replyText,
+                    content: `${replyText}\n\nHere's your design. Want to refine?`,
                     bundle,
                     creative_output: creative,
                   }));
@@ -301,6 +301,13 @@ export default function Page() {
                   }));
                   pollActiveRef.current = false;
                   return;
+                }
+
+                if (job.status === "running") {
+                  applyJobToAssistant((existing) => ({
+                    ...existing,
+                    content: "Still working...",
+                  }));
                 }
 
                 const delayMs = Math.max(500, (job.retry_after ?? 2) * 1000);

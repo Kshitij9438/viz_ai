@@ -238,5 +238,6 @@ def build_resolved_user_message(raw_message: str, context: DesignContext | dict[
         parts.append(f"Colors: {context['colors']}")
     if context.get("mood"):
         parts.append(f"Mood: {context['mood']}")
-    parts.append(raw_message.strip())
-    return " ".join(p for p in parts if p)
+    if parts:
+        return " ".join(parts)
+    return raw_message.strip()

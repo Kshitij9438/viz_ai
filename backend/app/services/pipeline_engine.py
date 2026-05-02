@@ -79,12 +79,10 @@ class ImagePipeline(BasePipeline):
 
     async def run(self, ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
         prompt = self._personalized_prompt(ctx, ctx.message)
-        raw_count = int(intent.parameters.get("count") or 1)
-        count = max(1, min(raw_count, 3))
         params = GenerateParams(
             output_type="image",
             prompt=prompt,
-            count=count,
+            count=1,
             style_tags=self._style_tags(ctx, intent),
             aspect_ratio=self._aspect_ratio(intent),
         )
@@ -95,6 +93,7 @@ class ImagePipeline(BasePipeline):
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         return _visual_result("image", "I made a visual direction for you.", bundle, intent)
 
@@ -113,7 +112,7 @@ class ImageEditPipeline(BasePipeline):
         params = GenerateParams(
             output_type="style_transfer" if reference else "image",
             prompt=prompt,
-            count=int(intent.parameters.get("count") or 2),
+            count=1,
             reference_image_url=reference,
             reference_strength=0.65 if reference else None,
             style_tags=self._style_tags(ctx, intent),
@@ -126,6 +125,7 @@ class ImageEditPipeline(BasePipeline):
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         return _visual_result("image", "I refined the visual direction.", bundle, intent)
 
@@ -174,6 +174,7 @@ scenes: array of 3-6 objects with title, description, visual_prompt
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         output = _creative_output("story", intent, bundle)
         output["outputs"].insert(0, {"kind": "story", "title": story.get("title"), "logline": story.get("logline"), "scenes": scenes})
@@ -195,7 +196,7 @@ class MoodboardPipeline(BasePipeline):
         params = GenerateParams(
             output_type="vision_board",
             prompt=prompt,
-            count=6,
+            count=1,
             style_tags=self._style_tags(ctx, intent),
             aspect_ratio="square",
         )
@@ -206,6 +207,7 @@ class MoodboardPipeline(BasePipeline):
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         return _visual_result("moodboard", "I built a moodboard direction.", bundle, intent)
 
@@ -254,6 +256,7 @@ poster_text: string
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         board = await run_generation(
             ctx.db,
@@ -267,6 +270,7 @@ poster_text: string
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         output = _creative_output("campaign", intent, poster)
         output["outputs"].insert(0, {"kind": "campaign_brief", **campaign})
@@ -298,6 +302,7 @@ class VideoPipeline(BasePipeline):
             session_id=ctx.session_id,
             taste=ctx.taste,
             business=ctx.business,
+            design_context=ctx.design_context,
         )
         return _visual_result("video", "I made a video-loop key visual placeholder.", bundle, intent)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ssl
 import logging
 
+from sqlalchemy import text
 from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
@@ -91,6 +92,13 @@ async def init_db() -> None:
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            if settings.DATABASE_URL.startswith("postgresql"):
+                await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS progress JSONB"))
+            elif settings.DATABASE_URL.startswith("sqlite"):
+                try:
+                    await conn.execute(text("ALTER TABLE jobs ADD COLUMN progress JSON"))
+                except Exception:
+                    pass
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}", exc_info=True)
