@@ -197,11 +197,91 @@ class JobWorker:
         if reply is not None and str(reply).strip():
             return True
         bundle = result_data.get("asset_bundle")
-        if isinstance(bundle, dict) and bundle.get("assets"):
-            return True
+        if isinstance(bundle, dict):
+            # Bundle persisted (e.g. image_success) even if URL rewrite drops all assets
+            if bundle.get("bundle_id"):
+                return True
+            if bundle.get("assets"):
+                return True
         if result_data.get("creative_output"):
             return True
         return False
+
+    async def _finalize_success(
+        self, job_id: str, result_data: dict[str, Any], *, started_at_perf: float
+    ) -> None:
+        """Write terminal success using a dedicated DB session.
+
+        The pipeline shares the claim session and commits many times; persisting
+        ``Job.status``/``Job.result`` here avoids a stale or inconsistent session
+        leaving the row stuck in ``running`` after ``image_success``.
+        """
+        status_before_ok = "running"
+        async with AsyncSessionLocal() as db:
+            job = (
+                await db.execute(select(Job).where(Job.id == job_id))
+            ).scalar_one_or_none()
+            if job is None:
+                try:
+                    logger.warning(
+                        "job_finalize_success_job_missing",
+                        extra={
+                            "event": "job_finalize_success_job_missing",
+                            "job_id": job_id,
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+            if job.status in _TERMINAL:
+                try:
+                    logger.info(
+                        "job_skipped",
+                        extra={
+                            "event": "job_skipped",
+                            "job_id": job_id,
+                            "reason": "already_terminal_before_success_persist",
+                            "status_before": job.status,
+                            "status_after": job.status,
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+            status_before_ok = job.status
+            job.status = "done"
+            job.result = result_data
+            job.completed_at = datetime.utcnow()
+            job.error = None
+            await db.commit()
+
+        try:
+            logger.info(
+                "job_finalized",
+                extra={
+                    "event": "job_finalized",
+                    "job_id": job_id,
+                    "status": "done",
+                    "has_result": True,
+                },
+            )
+        except Exception:
+            pass
+
+        try:
+            duration_ms = round((time.perf_counter() - started_at_perf) * 1000, 2)
+            logger.info(
+                "job_succeeded",
+                extra={
+                    "event": "job_succeeded",
+                    "job_id": job_id,
+                    "status_before": status_before_ok,
+                    "status_after": "done",
+                    "duration_ms": duration_ms,
+                },
+            )
+        except Exception:
+            pass
 
     async def _process_job(self, job_id: str) -> None:
         """Execute a single job with atomic claim and timeout."""
@@ -314,56 +394,7 @@ class JobWorker:
                     await self._finalize_failure(job_id, "Pipeline returned empty or invalid result")
                     return
 
-                # Reload row — session may have seen many commits inside pipeline
-                job = (await db.execute(select(Job).where(Job.id == job_id))).scalar_one()
-                if job.status in _TERMINAL:
-                    logger.info(
-                        "job_skipped",
-                        extra={
-                            "event": "job_skipped",
-                            "job_id": job_id,
-                            "reason": "terminal_before_success_write",
-                            "status_before": job.status,
-                            "status_after": job.status,
-                        },
-                    )
-                    return
-
-                status_before_ok = job.status
-                job.status = "done"
-                job.result = result_data
-                job.completed_at = datetime.utcnow()
-                job.error = None
-                await db.commit()
-
-                logger.info(
-                    "job_finalized",
-                    extra={
-                        "event": "job_finalized",
-                        "job_id": job_id,
-                        "status": job.status,
-                        "has_result": bool(job.result),
-                    },
-                )
-
-                # Phase 5: nothing after success commit may affect DB state
-                try:
-                    duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-                    logger.info(
-                        "job_succeeded",
-                        extra={
-                            "event": "job_succeeded",
-                            "job_id": job_id,
-                            "status_before": status_before_ok,
-                            "status_after": "done",
-                            "duration_ms": duration_ms,
-                        },
-                    )
-                except Exception:
-                    logger.exception(
-                        "job_succeeded_log_failed",
-                        extra={"event": "job_succeeded_log_failed", "job_id": job_id},
-                    )
+                await self._finalize_success(job_id, result_data, started_at_perf=started_at)
 
             except asyncio.TimeoutError:
                 try:
