@@ -324,6 +324,46 @@ class ChatPipeline(BasePipeline):
     async def run(self, ctx: PipelineContext, intent: IntentResult) -> PipelineResult:
         from app.services.design_context import format_confirmation, is_ready, readiness_state
 
+        if intent.intent == "explore":
+            prompt = (
+                "The user wants ideas/suggestions. Provide EXACTLY 3-4 distinct visual concepts based on their request. "
+                "Format as a simple numbered list where each item is 1 line. No extra chat.\n\n"
+                f"User: {ctx.message}"
+            )
+            raw_options = await ollama.complete(prompt)
+            
+            # Simple parsing of numbered list
+            options = []
+            for line in raw_options.split("\n"):
+                line = line.strip()
+                if line and line[0].isdigit() and line[1:3] in {". ", ") "}:
+                    text = line[2:].strip()
+                    options.append({
+                        "subject": text,
+                        "style": "distinctive"
+                    })
+            
+            if not options:
+                # Fallback if LLM didn't format correctly
+                options = [
+                    {"subject": "A minimalistic modern logo", "style": "minimal"},
+                    {"subject": "A vibrant digital illustration", "style": "vibrant"},
+                    {"subject": "A cinematic realistic scene", "style": "cinematic"}
+                ]
+                raw_options = "1. A minimalistic modern logo\n2. A vibrant digital illustration\n3. A cinematic realistic scene"
+
+            if ctx.design_context is not None:
+                ctx.design_context["last_suggestions"] = options
+                ctx.design_context["awaiting_selection"] = True
+
+            body = f"Here are a few directions we can explore:\n\n{raw_options}\n\nWhich one feels closest? Or want something different?"
+            
+            return PipelineResult(
+                reply=body,
+                creative_output={"type": "chat", "outputs": [], "metadata": {"intent": intent.model_dump()}},
+                tool_call={"name": "pipeline", "arguments": intent.model_dump()},
+            )
+
         if ctx.force_chat_pipeline:
             if ctx.awaiting_confirmation:
                 dc = ctx.design_context or {}

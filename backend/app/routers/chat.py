@@ -34,7 +34,7 @@ from app.services.design_context import (
     merge_design_context,
     readiness_state,
 )
-from app.services.generation_intent_gate import classify_generation_mode
+from app.services.generation_intent_gate import classify_generation_mode, is_explicit_confirmation
 from app.services.intent_engine import classify_intent
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
@@ -96,6 +96,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     message: str = Field(min_length=1, max_length=8000)
     attachments: list[Attachment] = Field(default_factory=list, max_length=8)
+    event_name: str = Field(default="user_message", max_length=50)
 
     @field_validator("message")
     @classmethod
@@ -201,6 +202,76 @@ async def chat(
     session = await _get_or_create_session(db, req.session_id, user.id)
 
     design_ctx = merge_design_context(getattr(session, "design_context", None) or {}, req.message)
+
+    if req.event_name == "session_load" or req.event_name == "session_switch":
+        design_ctx["confirmed"] = False
+        design_ctx["is_ready"] = False
+        design_ctx["awaiting_confirmation"] = False
+        design_ctx["last_intent"] = None
+        design_ctx.pop("last_suggestions", None)
+        design_ctx["awaiting_selection"] = False
+        _chat_log.info(
+            "session_reset_applied",
+            extra={"event": "session_reset_applied", "session_id": session.id}
+        )
+
+    if design_ctx.get("awaiting_selection"):
+        text = req.message.strip().lower()
+
+        # Match numeric selection
+        if text in {"1","2","3","4"}:
+            idx = int(text) - 1
+        elif text.startswith("option"):
+            try:
+                idx = int(text.split()[-1]) - 1
+            except ValueError:
+                idx = None
+        else:
+            idx = None
+
+        if idx is not None:
+            suggestions = design_ctx.get("last_suggestions", [])
+            if 0 <= idx < len(suggestions):
+                selected = suggestions[idx]
+
+                # Apply to context
+                design_ctx["subject"] = selected.get("subject")
+                design_ctx["style"] = selected.get("style")
+
+                design_ctx["awaiting_selection"] = False
+                design_ctx["is_ready"] = False
+                design_ctx["confirmed"] = False
+
+                session.design_context = dict(design_ctx)
+                await db.flush()
+
+                return ChatResponse(
+                    reply="Nice choice. Want to refine it further or should I generate this?",
+                    job_id=None,
+                    job_status=None,
+                    session_id=session.id,
+                    user_id=user.id,
+                    guest_token=identity.guest_token,
+                )
+
+    if req.event_name not in ("user_message", "confirm_generation"):
+        _chat_log.info(
+            "generation_blocked_non_user_event",
+            extra={"event": "generation_blocked_non_user_event", "event_name": req.event_name, "session_id": session.id}
+        )
+        return ChatResponse(
+            reply="I'm ready when you are.",
+            job_id=None,
+            job_status=None,
+            session_id=session.id,
+            user_id=user.id,
+            guest_token=identity.guest_token,
+        )
+
+    # Check for explicit confirmation flag
+    if req.event_name == "confirm_generation":
+        design_ctx["confirmed"] = True
+
     session.design_context = dict(design_ctx)
     await db.flush()
 
@@ -242,9 +313,34 @@ async def chat(
 
     # ---- Step 1b: Gate image/edit — gate_mode is sole routing authority (not LLM intent) ----
     if intent.intent in ("image", "edit"):
-        gate_mode = classify_generation_mode(
-            req.message, has_attachments=bool(req.attachments)
+        from app.services.agent_decision import propose_action
+        proposal = await propose_action(req.message, dict(design_ctx))
+        gate_mode = proposal.get("intent", "chat")
+        confidence = float(proposal.get("confidence", 0.0))
+
+        # SYSTEM VALIDATION LAYER
+        if confidence < 0.6:
+            gate_mode = "chat"
+
+        # NEVER allow generation without confirmation
+        if gate_mode == "generate" and not design_ctx.get("confirmed"):
+            _chat_log.info("generation_blocked_agent_no_confirmation")
+            gate_mode = "confirm"
+
+        # Explore should never generate
+        if gate_mode == "explore":
+            design_ctx["awaiting_selection"] = True
+
+        _chat_log.info(
+            "agent_proposal",
+            extra={
+                "event": "agent_proposal",
+                "intent": gate_mode,
+                "confidence": confidence,
+                "reasoning": proposal.get("reasoning"),
+            },
         )
+        
         ready = is_ready(design_ctx)
         _chat_log.info(
             "intent_classified",
@@ -265,9 +361,11 @@ async def chat(
                     session=session,
                     user_message=req.message,
                     attachments=[a.model_dump() for a in req.attachments] if req.attachments else None,
-                    design_context=dict(design_ctx),
+                    design_context=design_ctx,
                     **conv_kw,
                 )
+                session.design_context = dict(design_ctx)
+                await db.flush()
             except Exception:
                 result = {
                     "reply": "I hit a temporary issue. Your session is safe. Please try again in a moment.",
@@ -297,18 +395,31 @@ async def chat(
                 {"force_chat_pipeline": True, "refinement_mode": False},
             )
 
+        if gate_mode == "explore":
+            intent.intent = "explore"
+            return await _gated_converse_response(
+                {"force_chat_pipeline": True, "refinement_mode": False},
+            )
+
         if gate_mode == "refine":
             return await _gated_converse_response(
                 {"force_chat_pipeline": True, "refinement_mode": True},
             )
 
-        if gate_mode == "confirm" and not ready:
-            return await _gated_converse_response(
-                {"force_chat_pipeline": True, "refinement_mode": False},
-            )
+        if gate_mode == "confirm":
+            # If the user explicitly typed a confirmation word, set confirmed to True
+            if is_explicit_confirmation(req.message):
+                design_ctx["confirmed"] = True
+                session.design_context = dict(design_ctx)
+                await db.flush()
+            
+            if not design_ctx.get("confirmed"):
+                return await _gated_converse_response(
+                    {"force_chat_pipeline": True, "refinement_mode": False},
+                )
 
-        # Enqueue only: generate OR confirm with a ready design brief
-        if not (gate_mode == "generate" or (gate_mode == "confirm" and ready)):
+        # Enqueue only: confirm with a confirmed status and a ready design brief
+        if gate_mode != "confirm" or not design_ctx.get("confirmed"):
             return await _gated_converse_response(
                 {"force_chat_pipeline": True, "refinement_mode": False},
             )
@@ -348,6 +459,20 @@ async def chat(
     job_user_message = req.message
     if intent.intent in ("image", "edit"):
         job_user_message = build_resolved_user_message(req.message, design_ctx)
+        
+    if not design_ctx.get("confirmed"):
+        _chat_log.warning(
+            "generation_blocked_no_confirmation",
+            extra={"event": "generation_blocked_no_confirmation", "session_id": session.id}
+        )
+        return ChatResponse(
+            reply="I have a clear direction now. Want me to generate this?",
+            job_id=None,
+            job_status=None,
+            session_id=session.id,
+            user_id=user.id,
+            guest_token=identity.guest_token,
+        )
 
     # Dedup check
     existing_job_id = await check_dedup(user.id, session.id, job_user_message)
@@ -400,6 +525,11 @@ async def chat(
         from app.worker import JobWorker
         worker = JobWorker()
         await worker._process_job(job.id)
+        
+    # FIX: Clear confirmation state immediately after enqueuing
+    design_ctx["confirmed"] = False
+    session.design_context = dict(design_ctx)
+    await db.flush()
 
     # Set dedup marker
     await set_dedup(user.id, session.id, job_user_message, job.id)

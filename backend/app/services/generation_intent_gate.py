@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-GenerationMode = Literal["generate", "refine", "chat", "confirm"]
+GenerationMode = Literal["generate", "refine", "chat", "confirm", "explore"]
 
 
 def _is_descriptive_generation(text: str) -> bool:
@@ -19,6 +19,20 @@ def _is_descriptive_generation(text: str) -> bool:
         bool(words & keyword_words) or any(phrase in text for phrase in phrase_keywords)
     )
 
+EXPLORATION_KEYWORDS = ["suggest", "ideas", "options", "what can we", "give me some"]
+
+def is_explicit_confirmation(text: str) -> bool:
+    return text.strip().lower() in {
+        "yes",
+        "yes please",
+        "go ahead",
+        "do it",
+        "generate",
+        "create it",
+        "looks good",
+        "perfect",
+    }
+
 
 def classify_generation_mode(message: str, *, has_attachments: bool = False) -> str:
     text = (message or "").strip().lower()
@@ -26,16 +40,19 @@ def classify_generation_mode(message: str, *, has_attachments: bool = False) -> 
     if not text:
         return "chat"
 
+    if any(k in text for k in EXPLORATION_KEYWORDS):
+        return "explore"
+
     if has_attachments:
-        return "generate"
+        return "confirm"
 
     if any(word in text for word in ["generate", "create", "make", "draw", "paint", "design"]):
-        return "generate"
+        return "confirm"
 
     if _is_descriptive_generation(text):
-        return "generate"
+        return "confirm"
 
-    if any(word in text for word in ["yes", "go ahead", "looks good", "perfect"]):
+    if is_explicit_confirmation(text):
         return "confirm"
 
     if len(text.split()) <= 3:

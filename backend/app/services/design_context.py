@@ -14,10 +14,14 @@ class DesignContext(TypedDict, total=False):
     style: str | None
     colors: str | None
     mood: str | None
+    confirmed: bool | None
+    is_ready: bool | None
+    awaiting_confirmation: bool | None
+    last_intent: str | None
 
 
 def empty_design_context() -> DesignContext:
-    return {"subject": None, "style": None, "colors": None, "mood": None}
+    return {"subject": None, "style": None, "colors": None, "mood": None, "confirmed": False}
 
 
 def _norm(s: str | None, max_len: int = 240) -> str | None:
@@ -240,4 +244,4 @@ def build_resolved_user_message(raw_message: str, context: DesignContext | dict[
         parts.append(f"Mood: {context['mood']}")
     if parts:
         return " ".join(parts)
-    return raw_message.strip()
+    return "clarification_needed"
